@@ -1,0 +1,123 @@
+# Struct Rete
+
+ストラクト・レーテ。Struct Pass エコシステムの**連結軸**を担うリファレンス実装。
+
+> rete = ラテン語/イタリア語で「網」。学術的には精緻な微細網状構造（rete mirabile 等）を指す。
+
+## 位置づけ
+
+**Rete は StructPass リファレンス（[reference](https://github.com/structpass/reference)）のサテライトシステム**である。
+
+- **個別呼称**：**Rete**（先頭大文字固定）
+- **カテゴリ呼称**：**サテライトシステム**（本体に対し横並びで、エンドユーザーから見える独立プロダクト群の総称）
+- **本体との関係**：StructPass リファレンスを「コア」、Rete はその周囲を回る独立デプロイのサテライト 1 号機。本体のランタイム依存にはならない（落ちても本体は動く）が、エンドユーザーは Rete を直接触る点で裏方ポータルではない
+
+## 解く問題
+
+システム開発は、なぜか「最後まで見えない」。設計書で完成形を想像し、関係者は Slack／Teams／メール／Excel に分かれ、システムを初めて触れるのは開発の終盤——認識のズレは、そこで大きな手戻りとなって現れます。
+
+Rete はこの順序を逆転させる参照実装です。システムより先に顧客との回線を通し、本物の UI を見せながら、一緒に作っていく。想像してもらう開発から、触って決めてもらう開発へ。
+
+構想の全体像（従来開発の課題・繋ぐ手段・モック・第4の道）は [Rete構想スライド](./Rete構想.html) で説明しています。
+
+## 構成
+
+```
+Struct Hub（共通ダッシュボード + ユーザーID）
+  ├ Struct Reference（業界参照実装、別リポ: reference・OIDC RP）
+  ├ Home（通知/ダッシュボード）
+  ├ Desk（チャット×タスク融合 + 添付 + 通知）
+  ├ Files（共有 + バージョン履歴 + 権限）
+  └ Settings（テナント設定 + RBAC + 招待 + 監査ログ）
+```
+
+各サブシステムは OIDC 標準で Hub と接続。アドオン提供可能な疎結合構成。
+
+## 設計原則
+
+1. **OSS のソースは使わない** — 機能デザイン・セキュリティの参考情報としてのみ参照
+   （※ OIDC 等プロトコル準拠の認証ライブラリ／SDK の部品としての利用は許容。製品まるごとの組み込みは不可）
+2. **絞って磨く** — 連結に必要な最小集合だけ実装。機能を増やすことは敗北
+3. **アドオン間の疎結合** — ユーザーID だけ共有、システム間通信は最小限
+4. **OIDC 標準準拠** — 任意のサブシステムを別実装に載せ替え可能（脱出可能性）
+5. **アドオン売り** — 各サブシステム独立提供可能
+
+## 実装構成
+
+pnpm monorepo（TypeScript）。
+
+```
+packages/
+├ backend/   ← NestJS REST API（Prisma + PostgreSQL）
+├ frontend/  ← Next.js App Router（React 19 + Tailwind CSS）
+└ shared/    ← 共通型定義（TaskStatus 等の SSOT）
+```
+
+アーキテクチャの不変条件：Response DTO 境界 / Repository 分離（Entity → DTO の mapping は Service）/
+共通エラーフィルタ。
+
+実装済みの主要機能：OIDC 認証基盤（Rete=IdP）・Desk（チャット×タスク融合）・
+Files（版管理・タグ・添付）・HOME 掲示板・Settings（テナント設定 + RBAC + MFA）・
+PostgreSQL セッション永続化。
+
+公開版はこれらのコードとローカル評価用データを提供します。第三者の実データ・実運用資格情報を投入する前に、利用条件と接続先・認証設定を確認してください。MFA、メール送信、Reference連携は追加設定が必要です。
+
+版の目印は各 `package.json` のバージョン（現在 `0.1.0`）と、取得した公開リポジトリのcommitです。変更内容はそのリポジトリのcommit履歴で確認してください。
+
+### ドキュメント
+
+- `docs/architecture/operational-policy.md` — 運用ポリシー（エラー処理 / ログ / env var / データ保持）
+- `docs/scenarios/` — ユーザージャーニー（セットアップ〜日常運用〜インシデント対応）
+- モデルタブ（`packages/frontend/src/features/model/content/*.ts`）— UI 規約・用語・画面命名・モデル概念の正本（画面からも閲覧可能）
+- [SECURITY.md](./SECURITY.md) — 脆弱性の非公開報告と安全な評価
+- [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) — 依存パッケージ・フォント等の出所と表示条件
+
+## 評価環境の起動
+
+前提：Node.js >= 20.9.0（`.nvmrc` は20.18.1）／ pnpm 9.15.4（`packageManager` 指定）／ Docker Compose（DB 用）。フォント取得と依存インストールにはネットワーク接続が必要です。
+
+```bash
+# リポジトリのルートで実行。Windows PowerShellではcpの代わりにCopy-Itemも使えます。
+# 1. 環境変数の雛形をコピー（既存の設定ファイルは上書きしない）
+cp .env.example .env
+cp packages/backend/.env.example packages/backend/.env
+cp packages/frontend/.env.example packages/frontend/.env.local
+
+# 2. backendのDATABASE_URLを編集し、.envのDB設定と揃えてからDBを起動
+docker compose up -d postgres
+
+# 3. 依存、共有コード、Prisma Clientを準備
+pnpm install --frozen-lockfile
+pnpm run build:shared
+pnpm --filter @rete/backend prisma:generate
+
+# 4. 評価用DBへマイグレーションとデモデータを投入
+pnpm --filter @rete/backend prisma:migrate
+pnpm --filter @rete/backend prisma:seed
+
+# 5. 開発サーバー起動（backend + frontend 並行）
+pnpm dev
+```
+
+- frontend: http://localhost:3000 ／ backend: http://localhost:3001/api/v1
+- `DATABASE_URL` の `<user>` / `<password>` はルート `.env` の値に置き換え、ポートも揃えます。URL内の `connection_limit` / `pool_timeout` は残してください。雛形のままでは接続できません。
+- 各環境ファイルの認証鍵placeholderは評価用です。MFAを評価する場合は `MFA_TOTP_ENC_KEY` に有効な32バイトの鍵を設定します。共有・外部公開前の確認は [NOTICE.md](./NOTICE.md) を参照してください。
+- 初回の管理者メールは `SEED_ADMIN_EMAIL`（未設定時 `admin@rete.local`）です。管理者とデモユーザーの既定パスワードは [seed.ts](./packages/backend/prisma/seed.ts) にある公開情報です。
+- Referenceは別のアプリです。未設定時は連携を評価できません。Reteと同じポートで同時起動せず、各環境ファイルのURLとOIDC設定を揃えてください。
+- SMTP未設定時は招待メール等のメール依存機能を利用できません。ローカルでメールを評価する場合は `docker compose --profile dev up -d mailpit` とbackendのSMTP設定が必要です。
+- バックログタブは外部チケットツール（本公開版には含まれない）をiframe表示します。接続先が利用できなければ表示されません。
+- 上記はリポジトリのスクリプト・設定に合わせたローカル評価手順です。取得した版での初回起動結果と各機能の設定を確認してください。本番運用の手順・動作保証を意味しません。
+
+## 概念モデル
+
+- **system**：完全独立 instance（業種テンプレ別、DB / schema / instance 別）。1 system + Rete で完結
+- **team**：system 配下の組織単位（部 / チーム）
+- **channel**：team 配下の通信単位（chat channel / task list / file folder）
+- **account**：テナント内 identity SoT。複数 system に membership を持てる
+- **role**：各 system / team 内での権限（オーナー / 管理者 / メンバー）
+
+## ライセンス
+
+**PolyForm Free Trial License 1.0.0**（source-available）。
+特定の用途に適するかを評価するための、連続32暦日未満の利用を許諾します。評価以外の利用・評価期間を超える利用・再配布はこのライセンスの許諾範囲に含まれません。別途許諾・商用契約については窓口へご相談ください。
+詳細は [LICENSE.md](./LICENSE.md) と [NOTICE.md](./NOTICE.md) を参照してください。

@@ -1,0 +1,19 @@
+version: 2
+
+# 目的: 第三者 Action を full commit SHA で pin している代償（版更新が自動で来ない）を埋める（cmn-0250）。
+# 実需: CI run で「Node.js 20 is deprecated」の注釈が出ており、更新経路が無いと放置される。
+#
+# npm エコシステムは対象に含めない。dependabot の npm 更新は pnpm-lock.yaml を正しく扱えず
+# ロックファイルを壊しうるため、依存更新は従来どおり手元の pnpm で行う（Action の版だけを自動化する）。
+#
+# マージ前の受け入れ条件: PR の新しい SHA が、上流リポジトリの当該タグの指す commit と一致することを
+# 確認してからマージする（SHA pin の値は「人が一度上流タグと突合した」ことが根拠なので、自動更新を
+# 無条件マージすると pin の意味が薄まる）。
+updates:
+  - package-ecosystem: github-actions
+    directory: '/'
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'ci'

@@ -1,0 +1,27 @@
+{
+  "name": "@rete/shared",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Struct Rete 共有型定義・ユーティリティ",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "dev": "tsc --watch",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:cov": "vitest run --coverage",
+    "lint": "eslint \"src/**/*.ts\" --fix",
+    "lint:check": "eslint \"src/**/*.ts\" --no-fix"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^8.21.0",
+    "@typescript-eslint/parser": "^8.21.0",
+    "@vitest/coverage-v8": "4.1.11",
+    "eslint": "^9.18.0",
+    "typescript": "^5.7.2",
+    "vitest": "4.1.11"
+  }
+}

@@ -1,0 +1,77 @@
+{
+  // 未使用コード検出（未使用の export / ファイル / 依存パッケージ）。cmn-0244。
+  // この段階では「数えるだけ」で CI は落とさない。非ブロック化のレバーは package.json の
+  // check:unused に付けた --no-exit-code（検出件数を終了コードへ反映しない・設定エラーや
+  // クラッシュは非 0 のまま＝ツールが動いていない時は CI が赤くなる）。ブロック化＝この引数を外す。
+  // 閾値設定と赤化は初回件数を見てから別チケットで判断する。
+  // knip は 5 系に固定する。6 系の engines は node ^20.19.0 || >=22.12.0 で、CI が使う
+  // .nvmrc（20.18.1）を満たさない＝非ブロック step のまま静かにクラッシュし件数が一度もログに出ない。
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "workspaces": {
+    // ルートの scripts/*.mjs（constraint-drift 検査など）は pnpm script から呼ばれるが、
+    // knip の既定 entry では拾われないため明示する。
+    // ルートは lint / format をワークスペースへ委譲するだけで設定ファイルを持たない（*.config.* も
+    // .eslintrc も無い）。project へ書くと「マッチしない pattern」の hint が出るだけなので置かない。
+    // ルートの eslint が未使用 devDependency として出るのは偽陽性ではなく実体
+    // （各パッケージが自前で宣言しており、ルートからは一度も起動されない）＝伏せずに残す（cmn-0252）。
+    // prettier はここには出ない：ルートの format:check（package.json）が直接起動するため使用中の実体
+    // （cmn-0361 でコメントを実体へ是正・旧コメントは eslint / prettier 両方を「未使用」と書いていた）。
+    ".": {
+      "entry": ["scripts/*.mjs", "scripts/publish/export.mjs"],
+      "project": ["scripts/**/*.mjs"],
+      // lint-staged は .git/hooks/pre-commit（auto-installed・cmn-0421）から実行されるため、
+      // knip の静的解析では import も script 起動も見えず未使用依存に誤検出される。
+      // lint-staged.config.mjs の存在で「使用中」とみなすプラグイン機構は knip 5.88 では
+      // ルート workspace の enabler 解決に反映されない（実測済み）＝伏せて実体を正とする。
+      "ignoreDependencies": ["lint-staged"],
+    },
+    // shared は dist（ビルド生成物）経由で backend / frontend から参照される。entry を src/index.ts へ
+    // 明示的に固定し、package.json の main（dist/index.js）が変わっても公開 API が一斉に
+    // 「未使用」と誤検知されないようにする（cmn-0244 criteria 5）。
+    // knip はこれを冗長（推論と同じ）と報告するが、誤検知の再発防止として意図的に残す。
+    // includeEntryExports は cmn-0252。既定では entry（src/index.ts）の export は「入口だから使われる」
+    // 前提で検査対象外になり、shared に公開したが他パッケージからは一度も参照されていない API が
+    // 永久に検出されない盲点になっていた。件数は増えるが、増えた分がその盲点そのもの。
+    "packages/shared": {
+      "entry": ["src/index.ts"],
+      "project": ["src/**/*.ts", "*.config.{ts,mjs}"],
+      "includeEntryExports": true,
+    },
+    // backend の入口は NestJS の main.ts と、pnpm script から直接叩く prisma/*.ts（seed / unlock-admin /
+    // reset-e2e-fixtures）。後者を entry に入れないとファイルごと「未使用」になる。
+    "packages/backend": {
+      "entry": ["src/main.ts", "prisma/*.ts"],
+      "project": ["src/**/*.ts", "prisma/**/*.ts", "*.config.{ts,mjs}", "nest-cli.json"],
+      // project へ設定ファイルを含めても消えない偽陽性だけを、実体で裏取りしたものに限って置く（cmn-0252）。
+      // 「ソースの import には現れないが実行時 / ビルド時に要る」＝knip の静的解析では原理的に見えないもの。
+      // pg / @types/pg / tsconfig-paths は当初ここへ入れたが、裏取りの結果いずれも他パッケージの
+      // 通常依存として入る（pg は connect-pg-simple の dependencies、@types/pg は
+      // @types/connect-pg-simple の dependencies、tsconfig-paths は @nestjs/cli 自身の
+      // dependencies）ため、伏せずに検出させる側へ戻した＝真陽性だった。
+      // cmn-0260 で backend の直接依存から 3 件とも削除済み（build / type-check / jest 全件で実測）。
+      // ここへ伏せ字として戻さないこと＝戻すのは「削除を試して実測で壊れた」時だけで、その時は
+      // 壊れた内容を理由コメントに書く。
+      "ignoreDependencies": [
+        // Express.Multer.File の ambient 型として参照される（named import が無い）。
+        "@types/multer",
+        // nest-cli.json の webpack:true 経由。@nestjs/cli の webpack-defaults は
+        // `loader: 'ts-loader'` を文字列で指定し、webpack はプロジェクト側から解決する
+        // （CLI 自身の dependencies に ts-loader は無い）＝消すと nest build が壊れる。
+        "ts-loader",
+      ],
+    },
+    // frontend は Next のプラグインが app ディレクトリを自動で entry 認識する。
+    // 自前の起動スクリプト（scripts/dev.mjs / start.mjs）だけ明示する。
+    "packages/frontend": {
+      "entry": ["scripts/*.mjs"],
+      "project": ["src/**/*.{ts,tsx}", "scripts/**/*.mjs", "*.config.{ts,mjs}", ".eslintrc.json"],
+      // `next lint` が .eslintrc.json 経由で使う。knip 5.88 の ESLint プラグインは
+      // `eslint` が major 9 かつ `eslint-config-next` がある時、config 解決そのものを止める
+      // （node_modules/knip/dist/plugins/eslint/index.js の isLoadConfig。上流 rushstack#4965 由来）。
+      // extends の解決器（eslint-config-next への写像）は実装として在るが到達しない＝設定では回避できず、
+      // flat config へ移しても条件は「eslint v9 + eslint-config-next」なので消えない（cmn-0252 で実測）。
+      // よって下の project の .eslintrc.json は現状 no-op（将来 knip 側が解除した時に効く）。
+      "ignoreDependencies": ["eslint", "eslint-config-next"],
+    },
+  },
+}

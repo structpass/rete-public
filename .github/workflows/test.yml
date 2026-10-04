@@ -1,0 +1,85 @@
+name: Test
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Repo invariant checks
+        run: pnpm run check:repo-invariants
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -o pipefail
+          pnpm install --frozen-lockfile 2>&1 | tee "$RUNNER_TEMP/pnpm-install.log"
+      - name: Ignored build scripts check
+        run: pnpm run check:ignored-builds "$RUNNER_TEMP/pnpm-install.log"
+      - name: Generate Prisma Client
+        run: pnpm --filter @rete/backend run prisma:generate
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci?schema=public
+      - name: Build shared
+        run: pnpm --filter @rete/shared build
+      - name: Generate Next route types
+        run: pnpm --filter @rete/frontend exec next typegen
+      - name: Type check
+        run: pnpm run type-check
+      - name: Lint check
+        run: pnpm run lint:check
+      - name: Format check
+        run: pnpm run format:check
+      - name: Coverage threshold (all packages)
+        run: pnpm run test:cov
+      - name: Duplication check (jscpd, non-blocking)
+        run: pnpm run check:duplication
+      - name: Knip snapshot check
+        run: pnpm run check:knip-snapshot
+        env:
+          KNIP_SNAPSHOT_REQUIRED: '1'
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Cache npm (E2E)
+        uses: actions/cache@v6
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-e2e-npm-${{ hashFiles('e2e/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-e2e-npm-
+      - name: Install E2E dependencies
+        run: npm ci --ignore-scripts
+        working-directory: e2e
+      - name: Type check (E2E)
+        run: npm run type-check
+        working-directory: e2e
+      - name: Unit test (E2E)
+        run: npm run test:unit
+        working-directory: e2e

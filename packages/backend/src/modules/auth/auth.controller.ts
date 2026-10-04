@@ -1,0 +1,275 @@
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpException,
+  HttpStatus,
+  Post,
+  Req,
+  UnauthorizedException,
+  UseGuards,
+} from '@nestjs/common';
+import { ApiBody, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
+import type { Request } from 'express';
+import { ok, okMessage } from '../../common/dto/response.dto';
+import { clientIp, clientUserAgent } from '../../common/net/client-ip';
+import { AuthService, AuthenticatedUser } from './auth.service';
+import { toAccountResponse } from './auth.mapper';
+import { LoginDto } from './dto/login.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
+import { MfaCodeDto } from '../mfa/dto/mfa-code.dto';
+import { MfaService } from '../mfa/mfa.service';
+import { AuthenticatedGuard } from './guards/authenticated.guard';
+import { AuditRecorderService } from '../audit-logs/audit-recorder.service';
+import { AUDIT_RETE_SYSTEM_NAME } from '../audit-logs/audit-logs.constants';
+import { MFA_LOGIN_MAX_ATTEMPTS } from '../mfa/mfa.constants';
+import { LoginSettingsService } from '../login-settings/login-settings.service';
+
+@ApiTags('auth')
+@Controller('auth')
+export class AuthController {
+  constructor(
+    private readonly authService: AuthService,
+    private readonly mfaService: MfaService,
+    private readonly loginSettings: LoginSettingsService,
+    private readonly auditRecorder: AuditRecorderService,
+  ) {}
+
+  // 資格情報を受ける高リスク endpoint はグローバル(30/60s)より厳しく 5 req / 60s に絞る（brute-force 抑制）。
+  // R7: パスワード検証成功後、当該 account が MFA 有効なら full session を確立せず pendingMfa を session に退避し
+  // { mfaRequired:true } を返す（HTTP 200・本人特定情報は最小）。MFA 無効なら従来どおり full session を確立する。
+  // R8: enforced かつ MFA 未設定なら full session は確立しつつ { mfaSetupRequired:true } を返す（設定画面へ到達させる）。
+  // R9: ローカル認証経路として session.authMethod='local' を印付け（MFA チャレンジ/Enforcement は 'local' のみ適用）。
+  // H5: login は横断 interceptor 対象外のため AuthController で actionType='login' を明示記録する（二重記録回避）。
+  @ApiOperation({ summary: 'ログイン（email + password。MFA 有効時は要追加検証）' })
+  @ApiBody({ type: LoginDto })
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @HttpCode(HttpStatus.OK)
+  @Post('login')
+  async login(@Body() dto: LoginDto, @Req() req: Request) {
+    const user = await this.authService.validateCredentials(dto.email, dto.password);
+
+    // MFA 有効なら full session を確立せず pending 状態へ（2 段階・R7）。
+    if (await this.mfaService.verifyHasEnabledMfa(user.id)) {
+      req.session.authMethod = 'local';
+      req.session.pendingMfaAccountId = user.id;
+      req.session.pendingMfaAttempts = 0;
+      delete req.session.pendingMfaInteractionUid;
+      return ok({ mfaRequired: true });
+    }
+
+    await this.authService.resetLoginAttempts(user.id);
+    await this.establishSession(req, user);
+    req.session.authMethod = 'local';
+    delete req.session.mfaVerifiedAt;
+    this.recordLogin(req, user);
+
+    // enforced かつ MFA 未設定: session は確立しつつ設定フローへ誘導する（R8）。
+    if (await this.requiresMfaSetup(user.id)) {
+      return ok({ ...toAccountResponse(user), mfaSetupRequired: true });
+    }
+    return ok(toAccountResponse(user));
+  }
+
+  // R7: 2 段階目。pendingMfa を検証し、TOTP/バックアップコード成功で full session を確立する。
+  // pending 不在は MFA_REQUIRED（先にパスワードログインが必要）。試行上限超で pending を破棄（MFA 段の独立カウンタ・H6 補完）。
+  @ApiOperation({ summary: 'MFA チャレンジ（TOTP or バックアップコードで full session を確立）' })
+  @ApiBody({ type: MfaCodeDto })
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @HttpCode(HttpStatus.OK)
+  @Post('login/mfa')
+  async loginMfa(@Body() dto: MfaCodeDto, @Req() req: Request) {
+    if (req.session.pendingMfaInteractionUid) {
+      throw new HttpException(
+        { code: 'MFA_REQUIRED', message: 'OIDCログインは専用の認証画面から完了してください' },
+        HttpStatus.UNAUTHORIZED,
+      );
+    }
+    const accountId = req.session.pendingMfaAccountId;
+    if (!accountId) {
+      throw new HttpException(
+        { code: 'MFA_REQUIRED', message: '先にメールアドレスとパスワードでログインしてください' },
+        HttpStatus.UNAUTHORIZED,
+      );
+    }
+
+    await this.authService.assertMfaChallengeAllowed(accountId);
+    const verified = await this.mfaService.verifyLoginChallenge(accountId, dto.code);
+    if (!verified) {
+      const accountLocked = await this.authService.registerFailedMfaAttempt(accountId);
+      const attempts = (req.session.pendingMfaAttempts ?? 0) + 1;
+      if (accountLocked || attempts >= MFA_LOGIN_MAX_ATTEMPTS) {
+        // 上限到達: pending を破棄してパスワードからやり直させる（総当たり防御）。
+        delete req.session.pendingMfaAccountId;
+        delete req.session.pendingMfaAttempts;
+      } else {
+        req.session.pendingMfaAttempts = attempts;
+      }
+      throw new HttpException(
+        { code: 'MFA_INVALID_CODE', message: '認証コードが正しくありません' },
+        HttpStatus.UNAUTHORIZED,
+      );
+    }
+
+    const user = await this.authService.findActiveUser(accountId);
+    if (!user) {
+      // pending 中に account が無効化/削除された。pending を破棄して弾く。
+      delete req.session.pendingMfaAccountId;
+      delete req.session.pendingMfaAttempts;
+      delete req.session.pendingMfaInteractionUid;
+      throw new UnauthorizedException('アカウントが無効です');
+    }
+
+    await this.authService.resetLoginAttempts(accountId);
+    delete req.session.pendingMfaAccountId;
+    delete req.session.pendingMfaAttempts;
+    delete req.session.pendingMfaInteractionUid;
+    await this.establishSession(req, user);
+    req.session.authMethod = 'local';
+    req.session.mfaVerifiedAt = Date.now();
+    this.recordLogin(req, user);
+    return ok(toAccountResponse(user));
+  }
+
+  // status-check endpoint: 未ログインでも 401 にせず 200 + data:null を返す（rete-files-0024 / ADR 0030）。
+  // 401 はブラウザが抑止不能な console error を出し、Next dev tools が「N Issues」として累積表示する。
+  // 未ログインは正常状態でありエラー扱いしない。保護リソース側の 401（AuthenticatedGuard）は不変。
+  // throttle は資格情報を受けないためグローバル既定（30 req/60s）に委ねる（login の 5/60s のような強化は不要）。
+  @ApiOperation({ summary: '現在のログインユーザー情報（未ログインは data:null）' })
+  @Get('me')
+  async me(@Req() req: Request) {
+    // authed のとき passport は req.user を必ず付与するが、deserialize の取りこぼしに備え req.user も併せて見る。
+    const authed = typeof req.isAuthenticated === 'function' && req.isAuthenticated();
+    if (!authed || !req.user) return ok(null);
+
+    const user = req.user as AuthenticatedUser;
+    const account = toAccountResponse(user);
+    // 強制MFA × 未設定 × ローカル認証経路 の時だけ mfaSetupRequired を立てる（login R8 と同形・set-0032）。
+    // リロード/画面遷移後もフロントが「設定強制中」を復元できるようにし、横断ゲートが業務操作をブロックし続ける。
+    // SSO（authMethod!=='local'）には絶対立てない＝IdP MFA を尊重（R9）。判定は login と同じ requiresMfaSetup を再利用。
+    if (req.session?.authMethod === 'local' && (await this.requiresMfaSetup(user.id))) {
+      return ok({ ...account, mfaSetupRequired: true });
+    }
+    return ok(account);
+  }
+
+  // set-0035: 強制パスワード変更（自己変更）。AuthenticatedGuard で認証境界を担保し、session の本人 id に対して
+  // 現在PW照合 → 新PW がポリシー充足 → hash 更新＋mustChangePassword 解除を行う。PasswordChangeEnforcementGuard の
+  // EXEMPT に含めて変更導線自体は遮断されない。資格情報を受けるため login と同じ 5 req/60s に絞る（総当たり抑制）。
+  // actionType は明示記録（method 写像だと create になり不正確・H5 同旨）。
+  @ApiOperation({ summary: '自己パスワード変更（強制変更フローの完了）' })
+  @ApiBody({ type: ChangePasswordDto })
+  @UseGuards(AuthenticatedGuard)
+  @Throttle({ default: { limit: 5, ttl: 60000 } })
+  @HttpCode(HttpStatus.OK)
+  @Post('change-password')
+  async changePassword(@Body() dto: ChangePasswordDto, @Req() req: Request) {
+    const user = req.user as AuthenticatedUser;
+    const authMethod = req.session.authMethod;
+    const mfaVerifiedAt = req.session.mfaVerifiedAt;
+    await this.authService.changePassword(user.id, dto.currentPassword, dto.newPassword);
+
+    // Password-versioned Passport principals revoke every other Rete session. Rotate and re-login this
+    // browser with the new version so the user completing the forced-change flow stays signed in.
+    const updatedUser = await this.authService.findActiveUser(user.id);
+    if (!updatedUser) throw new UnauthorizedException('アカウントが無効です');
+    await this.establishSession(req, updatedUser);
+    if (authMethod) req.session.authMethod = authMethod;
+    if (mfaVerifiedAt) req.session.mfaVerifiedAt = mfaVerifiedAt;
+
+    // 変更成功を fire-and-forget で監査記録（best-effort・記録失敗でもレスポンスを壊さない）。
+    void this.auditRecorder.record({
+      actorAccountId: user.id,
+      actorName: user.name,
+      actorEmail: user.email,
+      systemId: null,
+      systemName: AUDIT_RETE_SYSTEM_NAME,
+      actionType: 'update',
+      feature: '認証',
+      summary: 'パスワードを変更しました',
+      ipAddress: clientIp(req),
+      userAgent: clientUserAgent(req),
+    });
+
+    return okMessage('パスワードを変更しました');
+  }
+
+  // H5: logout は POST だが method 写像すると actionType='create' になり不正確。
+  // 横断 interceptor を除外して AuthController で actionType='logout' を明示記録する（二重記録回避）。
+  @ApiOperation({ summary: 'ログアウト（session 破棄）' })
+  @UseGuards(AuthenticatedGuard)
+  @HttpCode(HttpStatus.OK)
+  @Post('logout')
+  async logout(@Req() req: Request) {
+    // session destroy 前にスナップショットを取る（destroy 後は req.user が消える）。
+    const user = req.user as AuthenticatedUser;
+    const ip = clientIp(req);
+    const ua = clientUserAgent(req);
+
+    await new Promise<void>((resolve, reject) => {
+      req.logout((err) => (err ? reject(err as Error) : resolve()));
+    });
+    await new Promise<void>((resolve, reject) => {
+      req.session.destroy((err) => (err ? reject(err as Error) : resolve()));
+    });
+
+    // session 破棄成功後に記録（失敗時は Promise が reject してここに到達しない = 記録不要）。
+    // fire-and-forget（best-effort）: 記録失敗でもレスポンスを壊さない。
+    void this.auditRecorder.record({
+      actorAccountId: user.id,
+      actorName: user.name,
+      actorEmail: user.email,
+      systemId: null,
+      systemName: AUDIT_RETE_SYSTEM_NAME,
+      actionType: 'logout',
+      feature: '認証',
+      summary: 'ログアウトしました',
+      ipAddress: ip,
+      userAgent: ua,
+    });
+
+    return okMessage('ログアウトしました');
+  }
+
+  // --- 内部ヘルパー ---
+
+  /** passport の req.logIn を Promise 化して full session を確立する（LocalAuthGuard.logIn 相当・serializeUser を起動）。 */
+  // H10b: session fixation 対策。OWASP 定石どおり認証成功時に session ID を作り直す。
+  // 攻撃者が事前に固定した session ID を認証後もそのまま昇格される余地を断つ（session.regenerate は
+  // 旧 session を破棄して新しい session ID を発行する）。login（MFA 無効）/ loginMfa（MFA 成功）の
+  // どちらも establishSession を通るため両経路で一律適用される。pendingMfa* は establishSession 直前に
+  // 既に delete 済みのため、regenerate が保持すべき状態を壊すことはない。SSO は OIDC provider 自前
+  // session（express-session と別系統）のため本経路では無影響。
+  private establishSession(req: Request, user: AuthenticatedUser): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      req.session.regenerate((err) => {
+        if (err) return reject(err as Error);
+        req.logIn(user, (err2) => (err2 ? reject(err2 as Error) : resolve()));
+      });
+    });
+  }
+
+  /** enforced（全体強制）かつ当該 account が confirmed MFA 未設定か（設定フローへ誘導すべきか・R8）。 */
+  private async requiresMfaSetup(accountId: string): Promise<boolean> {
+    if (!(await this.loginSettings.isMfaEnforced())) return false;
+    return !(await this.mfaService.hasConfirmedMfa(accountId));
+  }
+
+  /** ログイン成功を fire-and-forget で監査記録する（H5・記録失敗でもレスポンスを壊さない）。 */
+  private recordLogin(req: Request, user: AuthenticatedUser): void {
+    void this.auditRecorder.record({
+      actorAccountId: user.id,
+      actorName: user.name,
+      actorEmail: user.email,
+      systemId: null,
+      systemName: AUDIT_RETE_SYSTEM_NAME,
+      actionType: 'login',
+      feature: '認証',
+      summary: 'ログインしました',
+      ipAddress: clientIp(req),
+      userAgent: clientUserAgent(req),
+    });
+  }
+}

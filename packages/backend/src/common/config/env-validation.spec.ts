@@ -1,0 +1,255 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import {
+  assertValidNodeEnv,
+  parseReferenceRedirectUris,
+  validateDatabasePoolLimits,
+  validateReferenceRedirectUriRequiredInProduction,
+  REQUIRED_DB_POOL_PARAMS,
+  VALID_NODE_ENVS,
+} from './env-validation';
+
+const OIDC_ENV_KEYS = ['NODE_ENV', 'OIDC_REFERENCE_CLIENT_SECRET', 'OIDC_REFERENCE_REDIRECT_URIS'];
+
+describe('assertValidNodeEnv', () => {
+  it.each(VALID_NODE_ENVS)('既知値 %s は通過する', (value) => {
+    expect(() => assertValidNodeEnv(value)).not.toThrow();
+  });
+
+  it('未設定（undefined）は required で throw する', () => {
+    expect(() => assertValidNodeEnv(undefined)).toThrow(/NODE_ENV is required/);
+  });
+
+  it('空文字は required で throw する', () => {
+    expect(() => assertValidNodeEnv('')).toThrow(/NODE_ENV is required/);
+  });
+
+  it('既知値以外（typo）は must be one of で throw する', () => {
+    expect(() => assertValidNodeEnv('prod')).toThrow(/must be one of/);
+    expect(() => assertValidNodeEnv('PRODUCTION')).toThrow(/must be one of/);
+  });
+});
+
+// cmn-0249: redirect_uris のパースを 1 本化し、起動ガード側と実登録側が同じ結果を返すようにした。
+// 共通退避（beforeEach / afterEach）で env を巻き戻し、it ごとの手書き退避を不要にしている。
+describe('parseReferenceRedirectUris（cmn-0249）', () => {
+  let envBackup: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    envBackup = { ...process.env };
+    for (const key of OIDC_ENV_KEYS) delete process.env[key];
+  });
+
+  afterEach(() => {
+    for (const key of OIDC_ENV_KEYS) {
+      if (envBackup[key] === undefined) delete process.env[key];
+      else process.env[key] = envBackup[key];
+    }
+  });
+
+  it.each([
+    ['undefined', undefined, []],
+    ['空文字', '', []],
+    ['カンマのみ', ',', []],
+    ['空白・カンマのみ', '  ,  ', []],
+    ['単一の URI', 'https://ref.example.com/cb', ['https://ref.example.com/cb']],
+    [
+      '複数 URI',
+      'https://ref.example.com/cb,http://ref2.example.com/cb',
+      ['https://ref.example.com/cb', 'http://ref2.example.com/cb'],
+    ],
+    ['trim', '  https://ref.example.com/cb  ', ['https://ref.example.com/cb']],
+    [
+      '空要素除去',
+      'https://a.example.com,,https://b.example.com',
+      ['https://a.example.com', 'https://b.example.com'],
+    ],
+    ['重複除去', 'https://a.example.com/cb,https://a.example.com/cb', ['https://a.example.com/cb']],
+  ])('%s を渡したとき %j を返すこと', (_label, input, expected) => {
+    expect(parseReferenceRedirectUris(input)).toEqual(expected);
+  });
+});
+
+describe('validateReferenceRedirectUriRequiredInProduction（cmn-0249）', () => {
+  let envBackup: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    envBackup = { ...process.env };
+    for (const key of OIDC_ENV_KEYS) delete process.env[key];
+  });
+
+  afterEach(() => {
+    for (const key of OIDC_ENV_KEYS) {
+      if (envBackup[key] === undefined) delete process.env[key];
+      else process.env[key] = envBackup[key];
+    }
+  });
+
+  it('NODE_ENV 未設定なら redirect URI 不備でも起動を止めないこと', () => {
+    process.env.OIDC_REFERENCE_CLIENT_SECRET = 's3cret';
+    process.env.OIDC_REFERENCE_REDIRECT_URIS = '';
+    expect(validateReferenceRedirectUriRequiredInProduction()).toBeNull();
+  });
+
+  it('NODE_ENV=development なら redirect URI 不備でも起動を止めないこと', () => {
+    process.env.NODE_ENV = 'development';
+    process.env.OIDC_REFERENCE_CLIENT_SECRET = 's3cret';
+    process.env.OIDC_REFERENCE_REDIRECT_URIS = '';
+    expect(validateReferenceRedirectUriRequiredInProduction()).toBeNull();
+  });
+
+  it('本番＋CLIENT_SECRET 未設定なら redirect URI 検査は走らないこと（cmn-0230）', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_REFERENCE_REDIRECT_URIS = 'invalid';
+    expect(validateReferenceRedirectUriRequiredInProduction()).toBeNull();
+  });
+
+  it('本番＋CLIENT_SECRET 設定＋有効 URI なら起動 OK', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_REFERENCE_CLIENT_SECRET = 'a'.repeat(32);
+    process.env.OIDC_REFERENCE_REDIRECT_URIS = 'https://ref.example.com/cb';
+    expect(validateReferenceRedirectUriRequiredInProduction()).toBeNull();
+  });
+
+  // cmn-0249: localhost 宛を本番で禁止する。
+  it('本番で localhost 宛 URI を含むと起動エラーを返すこと（cmn-0249）', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_REFERENCE_CLIENT_SECRET = 'a'.repeat(32);
+    process.env.OIDC_REFERENCE_REDIRECT_URIS = 'http://localhost:3001/api/v1/auth/oidc/callback';
+    expect(validateReferenceRedirectUriRequiredInProduction()).toMatch(
+      /localhost 宛のため本番では使用できません/,
+    );
+  });
+
+  it('本番で 127.0.0.1 宛 URI を含むと起動エラーを返すこと（cmn-0249）', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_REFERENCE_CLIENT_SECRET = 'a'.repeat(32);
+    process.env.OIDC_REFERENCE_REDIRECT_URIS = 'http://127.0.0.1:3001/cb';
+    expect(validateReferenceRedirectUriRequiredInProduction()).toMatch(
+      /localhost 宛のため本番では使用できません/,
+    );
+  });
+
+  it('本番で IPv6 ループバック宛 URI（hostname は [::1] とブラケット付きで返る）を含むと起動エラーを返すこと', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_REFERENCE_CLIENT_SECRET = 'a'.repeat(32);
+    process.env.OIDC_REFERENCE_REDIRECT_URIS = 'https://[::1]:3001/cb';
+    expect(validateReferenceRedirectUriRequiredInProduction()).toMatch(
+      /localhost 宛のため本番では使用できません/,
+    );
+  });
+
+  it('本番で 0.0.0.0 宛 URI を含むと起動エラーを返すこと', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_REFERENCE_CLIENT_SECRET = 'a'.repeat(32);
+    process.env.OIDC_REFERENCE_REDIRECT_URIS = 'http://0.0.0.0:3001/cb';
+    expect(validateReferenceRedirectUriRequiredInProduction()).toMatch(
+      /localhost 宛のため本番では使用できません/,
+    );
+  });
+
+  it('本番で http 以外の scheme は起動エラーを返すこと（cmn-0249）', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_REFERENCE_CLIENT_SECRET = 'a'.repeat(32);
+    process.env.OIDC_REFERENCE_REDIRECT_URIS = 'ftp://ref.example.com/cb';
+    expect(validateReferenceRedirectUriRequiredInProduction()).toMatch(
+      /scheme は http\/https のみ/,
+    );
+  });
+
+  it('本番で URL として解析できない値は起動エラーを返すこと（cmn-0249）', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.OIDC_REFERENCE_CLIENT_SECRET = 'a'.repeat(32);
+    process.env.OIDC_REFERENCE_REDIRECT_URIS = 'not-a-url';
+    expect(validateReferenceRedirectUriRequiredInProduction()).toMatch(
+      /有効な URL 形式ではありません/,
+    );
+  });
+});
+
+describe('validateDatabasePoolLimits（cmn-0251）', () => {
+  const BASE = 'postgresql://u:p@localhost:5432/rete?schema=public';
+
+  it('connection_limit / pool_timeout が揃っていれば null（OK）', () => {
+    expect(validateDatabasePoolLimits(`${BASE}&connection_limit=5&pool_timeout=20`)).toBeNull();
+  });
+
+  it.each(REQUIRED_DB_POOL_PARAMS)('%s が欠けていたら理由を返す（起動時に気付ける）', (param) => {
+    const params = REQUIRED_DB_POOL_PARAMS.filter((p) => p !== param)
+      .map((p) => `${p}=5`)
+      .join('&');
+    const reason = validateDatabasePoolLimits(`${BASE}&${params}`);
+    expect(reason).toContain(param);
+  });
+
+  it('プール指定が一切無い接続文字列（既存 .env の形）は理由を返す', () => {
+    // テンプレートに書くだけでは既存 .env へ伝播しない＝この検査が唯一の歯止め。
+    const reason = validateDatabasePoolLimits(BASE);
+    expect(reason).toMatch(/connection_limit/);
+    expect(reason).toMatch(/pool_timeout/);
+  });
+
+  it('値が空文字なら「指定あり」と見なさない（?connection_limit= のような書き損じ）', () => {
+    expect(validateDatabasePoolLimits(`${BASE}&connection_limit=&pool_timeout=20`)).toContain(
+      'connection_limit',
+    );
+  });
+
+  it('DATABASE_URL 未設定は本検査の対象外（必須検査は別で行う）', () => {
+    expect(validateDatabasePoolLimits(undefined)).toBeNull();
+    expect(validateDatabasePoolLimits('')).toBeNull();
+  });
+
+  it('URL として解析できない接続文字列は本検査の対象外（形式不正は Prisma が落とす）', () => {
+    expect(validateDatabasePoolLimits('not-a-url')).toBeNull();
+  });
+
+  // ここから下は「存在するだけ」では目的を満たさない値の検査（cmn-0251 Quality cycle 2 の反映）。
+  it('pool_timeout=0（無限待ち）は通さない＝防ぎたい状態そのもの', () => {
+    expect(validateDatabasePoolLimits(`${BASE}&connection_limit=5&pool_timeout=0`)).toContain(
+      'pool_timeout',
+    );
+  });
+
+  it('pool_timeout が最長トランザクション上限（15 秒）未満なら通さない', () => {
+    // 短すぎると、tx を占有している側より先に無関係なリクエストが接続待ち超過で 503 になる。
+    expect(validateDatabasePoolLimits(`${BASE}&connection_limit=5&pool_timeout=10`)).toContain(
+      'pool_timeout',
+    );
+  });
+
+  it('connection_limit=0 や過大な指定は通さない（上限の意味が失われる）', () => {
+    expect(validateDatabasePoolLimits(`${BASE}&connection_limit=0&pool_timeout=20`)).toContain(
+      'connection_limit',
+    );
+    expect(validateDatabasePoolLimits(`${BASE}&connection_limit=500&pool_timeout=20`)).toContain(
+      'connection_limit',
+    );
+  });
+
+  it('整数でない値は通さない', () => {
+    expect(validateDatabasePoolLimits(`${BASE}&connection_limit=abc&pool_timeout=20`)).toContain(
+      'connection_limit',
+    );
+    expect(validateDatabasePoolLimits(`${BASE}&connection_limit=5&pool_timeout=20.5`)).toContain(
+      'pool_timeout',
+    );
+  });
+
+  it('main.ts が起動経路でこの検査を呼び、本番だけ起動を止める', () => {
+    // 純関数の spec だけでは配線が消えても緑のままになる（CORS 側と同じ手法で bootstrap を pin する）。
+    const mainSource = readFileSync(join(__dirname, '../../main.ts'), 'utf8');
+    expect(mainSource).toContain('validateDatabasePoolLimits(process.env.DATABASE_URL)');
+    expect(mainSource).toMatch(/NODE_ENV === 'production'/);
+    expect(mainSource).toContain('logger.warn(poolProblem)');
+  });
+
+  it('seed.ts も同じ検査を呼び、警告を出して完走する（throw しない・cmn-0347）', () => {
+    // criteria 3: seed は独立プロセスで main.ts の検査を通らないため、環境構築の順序
+    // （DB 作成 → seed → アプリ配備）でプール指定なしのまま進むのを防ぐ。警告のみで止めない
+    // （本番同様の起動拒否をすると環境構築の順序が壊れる）。
+    const seedSource = readFileSync(join(__dirname, '../../../prisma/seed.ts'), 'utf8');
+    expect(seedSource).toContain('validateDatabasePoolLimits(process.env.DATABASE_URL)');
+    expect(seedSource).toContain('console.warn(`[seed]');
+  });
+});

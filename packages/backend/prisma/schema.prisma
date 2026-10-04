@@ -1,0 +1,1644 @@
+// Prisma Schema for Struct Rete
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// Enums
+// ============================================================
+
+// 招待ステータス。PENDING=発行済・未受諾 / ACCEPTED=受諾済 / EXPIRED=期限切れ（明示セット or effective 導出）。
+// effective status の算出ロジックは invite.mapper で担う（PENDING かつ expiresAt < now → 表示上 EXPIRED）。
+enum InviteStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+}
+
+// 値は @rete/shared の TaskStatus enum と完全一致させる（SSOT は shared 側）。
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  IN_REVIEW
+  DONE
+}
+
+// チャットのテーマ（タイトル付きスレッド）の状態。OPEN=進行中 / CLOSED=収束済。
+enum ChatThemeStatus {
+  OPEN
+  CLOSED
+}
+
+// 値は @rete/shared の Role enum と完全一致させる（SSOT は shared 側）。
+// RBAC の最小核: ADMIN=掲示板など管理操作可 / MEMBER=閲覧のみ（既定）。
+enum Role {
+  ADMIN
+  MEMBER
+}
+
+// 器（Space）の種別（CM-2 / ADR 0037）。値は @rete/shared SpaceKind と完全一致させる（SSOT は shared 側）。
+// kind ごとに projectId / ownerId / peerAccountId の有無が変わる判別共用体。制約は手書き CHECK（space_kind_shape）で担保。
+enum SpaceKind {
+  CHANNEL
+  GROUP
+  PERSONAL_MEMO
+  PERSONAL_DM
+}
+
+// メンバーシップのスコープ種別（CM-2 / ADR 0037）。値は @rete/shared MembershipScopeType と完全一致させる。
+// 可視範囲＝器のメンバーシップ1階層。CHANNEL は親 PROJECT membership の可視性に加算する直接スコープ。
+enum MembershipScopeType {
+  ORGANIZATION
+  PROJECT
+  CHANNEL
+  GROUP
+}
+
+// ============================================================
+// Master: Category (タスクの機能領域分類 — 入荷 / 出荷 / 在庫 等)
+// ============================================================
+
+model Category {
+  id         Int       @id @default(autoincrement())
+  name       String
+  // 所属する器（Space / rete-desk-0158）。分類は Space 単位スコープ。全 Space 種別
+  // （CHANNEL/GROUP/PERSONAL_MEMO/PERSONAL_DM）が独自の分類セットを持つ。
+  // onDelete: Cascade — Space 削除でその分類も消える。
+  spaceId    String    @map("space_id")
+  sortOrder  Int       @default(0) @map("sort_order")
+  // アーカイブ日時（rete-desk-0140）。非 null = アーカイブ済。削除は紐づくタスクがあると不可
+  // （onDelete: Restrict + app 層 409）のため、使わなくなった分類は本列で非表示化する。
+  // アーカイブ済分類は一覧既定で除外され、所属タスクもツリー/一覧に出ない。物理削除はしない。
+  archivedAt DateTime? @map("archived_at") @db.Timestamptz
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  space Space  @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  tasks Task[]
+
+  // 同一 Space 内で分類名はユニーク（別 Space は同名可 / rete-desk-0158）。
+  @@unique([spaceId, name])
+  @@index([spaceId])
+  @@map("categories")
+}
+
+// ============================================================
+// Task
+// ============================================================
+//
+// 将来の拡張余地（今は作らない、参考メモ）:
+//   channelId / conversationId / assigneeId(User FK) を後から素直に追加できるよう、
+//   現状は categoryId 必須・assignee は名前文字列で持つ最小構造に留める。
+//   先回りの nullable FK や未使用テーブルは over-engineering のため作らない。
+// 親子の最大 4 階層という制約は DB ではなく app 層で担保する（DB は自己 FK のみ）。
+
+model Task {
+  id            Int        @id @default(autoincrement())
+  title         String
+  description   String?
+  status        TaskStatus @default(TODO)
+  // 顛末（てんまつ）= タスクの結論・決定事項。status=DONE で必須（完了ゲート、app 層で担保）。
+  // 未完了タスクは null 可。plain text で保持し、将来 RTE 化（DBT-1）してもレンダリングのみ拡張する。
+  tenmatsu      String?
+  // 所属分類（rete-desk-0158 で nullable 化＝未分類を許可）。null = 未分類バケットに集約表示。
+  categoryId    Int?       @map("category_id")
+  parentTaskId  Int?       @map("parent_task_id")
+  // 同一兄弟グループ（同 parentTaskId・トップレベルは parentTaskId=null かつ同 categoryId）内の表示順。
+  // Category.sortOrder と同方針。挿入時シフトで連番を維持する（fractional order は採らない）。
+  sortOrder     Int        @default(0) @map("sort_order")
+  // 昇格元 ChatTheme（チャット→タスク昇格の片方向リンク）。昇格由来でないタスクは null。
+  sourceThemeId String?    @map("source_theme_id")
+  // 所属する器（CM-2 / ADR 0037）。移行②で既存タスクは DEFAULT_CHANNEL_ID へ backfill。nullable は移行期のため。
+  // チャネル間移動は spaceId 付替え（同 project 内に app 層で制限）。プロジェクト間移動は不可（§6）。器削除で Cascade。
+  spaceId       String?    @map("space_id")
+  // 担当者は Account への FK（rete-desk-0062・ADR 0017 反転）。未割当は null。
+  assigneeId    String?    @map("assignee_id")
+  // 旧フリーテキスト担当者名。FK 化後も移行期データ温存のため残す（表示は assignee?.name ?? assigneeName）。
+  assigneeName  String?    @map("assignee_name")
+  // 作成者（所有者）。H4 認可 enforcement の所有者判定基準。onDelete: SetNull で Account 削除時 null 化（タスクは残す）。
+  // 既存行は null（バックフィル不要）—— null owner は ADMIN のみ変更可能（assertOwnerOrAdmin の仕様）。
+  ownerId       String?    @map("owner_id")
+  startDate     DateTime?  @map("start_date") @db.Timestamptz
+  dueDate       DateTime?  @map("due_date") @db.Timestamptz
+  createdAt     DateTime   @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime   @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  // onDelete: Restrict — カテゴリは紐づくタスクが残る限り削除不可（マスタ保護）。
+  // categoryId nullable（rete-desk-0158）のため relation も optional（未分類タスクは category null）。
+  category    Category?      @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  // onDelete: SetNull — 親タスク削除時に子の parentTaskId を null 化しトップレベルへ昇格（parentTaskId は nullable）。
+  parentTask  Task?          @relation("TaskSubtasks", fields: [parentTaskId], references: [id], onDelete: SetNull)
+  subtasks    Task[]         @relation("TaskSubtasks")
+  // onDelete: SetNull — 元テーマ削除でタスクは残しリンクのみ失効（昇格済タスクの消失を防ぐ）。
+  sourceTheme ChatTheme?     @relation("ThemePromotedTasks", fields: [sourceThemeId], references: [id], onDelete: SetNull)
+  // onDelete: SetNull — 担当 Account 削除時はタスクを残し担当のみ解除（assigneeId を null 化）。
+  assignee    Account?       @relation(fields: [assigneeId], references: [id], onDelete: SetNull)
+  // onDelete: SetNull — 作成者 Account 削除時はタスクを残し所有者のみ失効（ownerId を null 化）。
+  owner       Account?       @relation("TaskOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  // 所属する器（CM-2）。onDelete: Cascade — 器削除でそのタスクも消える。
+  space       Space?         @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  // 添付されたファイル（Desk 添付 FL-3）。タスク削除で添付も Cascade 消去。
+  attachments Attachment[]
+  // タスクへのコメント（dsk-0216）。タスク削除でコメントも Cascade 消去。
+  comments    TaskComment[]
+  // タスク属性変更の監査ログ（dsk-0223）。タスク削除で監査行も Cascade 消去（コメントと同方針）。
+  activities  TaskActivity[]
+  // 説明/顛末の宛先（メンション先 / dsk-0203・ChatThemeMention のタスク版）。タスク削除で Cascade。
+  mentions    TaskMention[]
+  // 起点カード（題名・説明）への絵文字リアクション（dsk-0297・Reaction の4択XORの一つ）。
+  // タスク削除で Cascade。findAllForTree 等の一覧経路では include しない（findById のみ）。
+  reactions   Reaction[]
+
+  @@index([categoryId])
+  @@index([parentTaskId])
+  @@index([status])
+  // 兄弟グループ（categoryId + parentTaskId）内を sortOrder 順で引くツリー主クエリに効く。
+  @@index([categoryId, parentTaskId, sortOrder])
+  // CM-2: 器スコープのツリー兄弟グループ（spaceId + categoryId + parentTaskId）内 sortOrder 採番/取得に効く。
+  // category は Space スコープ（rete-desk-0158）。スライスBで spaceId 絞りが作動（Slice A は全タスクが default space）。
+  @@index([spaceId, categoryId, parentTaskId, sortOrder])
+  // 元テーマ削除時の onDelete: SetNull カスケード（sourceThemeId による逆 JOIN）を効かせる。
+  @@index([sourceThemeId])
+  // 担当 Account 削除時の onDelete: SetNull カスケード（assigneeId 逆 JOIN）を効かせる。
+  @@index([assigneeId])
+  // 作成者 Account 削除時の onDelete: SetNull カスケード（H4 所有者 enforcement）。
+  @@index([ownerId])
+  @@map("tasks")
+}
+
+// ============================================================
+// TaskComment (タスクへのコメント / dsk-0216)
+// ============================================================
+//
+// タスク専用のコメント。ChatMessage の構造を範に取りつつ task で隔離する（ポリモーフィック化しない）。
+// チャットの未読集約ホットパス（ChatMessage の複合 index）には一切影響しない独立テーブル。
+model TaskComment {
+  id        String   @id @default(uuid())
+  taskId    Int      @map("task_id")
+  authorId  String   @map("author_id")
+  // 本文はリッチテキスト（HTML）。保存前に service が sanitize する（ADR 0019・XSS 多層防御の保存側）。
+  body      String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  // onDelete: Cascade — タスク削除でそのコメントも消える（ChatMessage→ChatTheme と同方針）。
+  task        Task                 @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  // onDelete: Restrict — コメントが残る限り投稿者 Account を消せない（ChatMessage.author と同方針）。
+  author      Account              @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  // コメント＝スレッド投稿物への添付（dsk-0249・ChatMessage.attachments と対称）。コメント削除で添付も消える。
+  attachments Attachment[]
+  // このコメントのメンション先（@誰宛て / dsk-0203・ChatMessageMention のタスク版）。コメント削除で Cascade 消去。
+  mentions    TaskCommentMention[]
+  // このコメントに付いた絵文字リアクション（dsk-0297・Reaction の3つ目の対象）。コメント削除で Cascade 消去。
+  reactions   Reaction[]
+
+  // タスク別の時系列取得（GET /tasks/:id/comments・createdAt 昇順）に効く複合 index。
+  @@index([taskId, createdAt])
+  // 投稿者 Account 削除時の onDelete: Restrict 逆引き（authorId による参照チェック）を seq scan に
+  // しないための index（ChatMessage の @@index([authorId]) と同方針 / 非対称を作らない）。
+  @@index([authorId])
+  @@map("task_comments")
+}
+
+// ============================================================
+// TaskActivity (タスク属性変更の監査ログ / dsk-0223)
+// ============================================================
+//
+// タスクの属性（status / category / assignee / startDate / dueDate / parent）が変わった事実を
+// 1 変更 1 行で記録する監査ログ。TaskComment の構造を範に取りつつ activity で隔離する。
+// 監査はスナップショット方針: 参照先（カテゴリ名・担当名・親 title 等）の表示ラベルを
+// 「書込時点で解決して」fromLabel/toLabel に文字列で格納する。後から参照先が改名・削除されても
+// 当時の記録は不変に保たれる（FK で名前を引き直さない＝履歴の意味が変質しない）。
+model TaskActivity {
+  id             String   @id @default(uuid())
+  taskId         Int      @map("task_id")
+  // 変更を行った操作者 Account。内部経路（user 未指定）の変更は null 許容。
+  actorAccountId String?  @map("actor_account_id")
+  // 変更フィールド種別: 'status' | 'category' | 'assignee' | 'startDate' | 'dueDate' | 'parent' | 'space'
+  //   | 'outcome'（顛末の更新）| 'thread'（スレッド=起点カードの更新）
+  //   | 'commentAdd'（メッセージを追加・toLabel=本文抜粋）| 'commentEdit'（メッセージを編集・toLabel=本文抜粋）。
+  // DB CHECK 制約（dsk-0225 / dsk-0246 / dsk-0269・マイグレ 20260624_add_task_activity_field_check ＋
+  //   20260627100000_add_task_activity_outcome_thread ＋ 20260703093500_add_task_activity_comment_add_edit）
+  //   が許容値集合を強制する。
+  // enum 型化しないのは値追加が軽い String+CHECK を保つため（'space'/'outcome'/'thread'/'commentAdd'/'commentEdit' 追加もこの形）。
+  // Prisma は CHECK を schema 表現しないため、アプリ側の許容値 SSOT は @rete/shared の TaskActivityField
+  //   union（cmn-0211 で backend/frontend の二重定義を集約）＋ マイグレーション SQL の CHECK。値を追加する
+  //   時に揃える箇所は同 union の JSDoc に記載。
+  field          String
+  // 変更前の表示ラベル（null=未設定）。スナップショット方針で書込時に解決して格納（上記コメント参照）。
+  fromLabel      String?  @map("from_label")
+  // 変更後の表示ラベル（null=未設定）。
+  toLabel        String?  @map("to_label")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // onDelete: Cascade — タスク削除で監査行も消える（TaskComment→Task と同方針）。
+  task  Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  // onDelete: SetNull — 操作者 Account 削除時は監査行を残し操作者のみ失効（actorAccountId を null 化）。
+  // 監査は「誰が」より「何がどう変わったか」を主とするため、Account 消失でも記録は保全する（Restrict にしない）。
+  actor Account? @relation("TaskActivityActor", fields: [actorAccountId], references: [id], onDelete: SetNull)
+
+  // タスク別の時系列取得（GET /tasks/:id/activities・createdAt 昇順）に効く複合 index。
+  // id を第3キーに含める（dsk-0228）: listByTask は createdAt desc, id desc の複合ソートで
+  // LIMIT 打ち切りするため、createMany の同一 createdAt バケツが大きくても打ち切りが索引内で完結する。
+  @@index([taskId, createdAt, id])
+  // 操作者 Account 削除時の onDelete: SetNull 逆引き（actorAccountId による参照チェック）を seq scan にしない。
+  @@index([actorAccountId])
+  @@map("task_activities")
+}
+
+// ============================================================
+// TaskMention (タスクの説明/顛末 → メンション先アカウントの多対多 join / dsk-0203)
+// ============================================================
+//
+// チャット側 ChatThemeMention（rete-desk-0116）のタスク版。タスク本文（説明=DESCRIPTION / 顛末=TENMATSU）
+// ごとに宛先（To）を保持する。From=Task.ownerId（作成者）。説明・顛末は独立した update で別々に保存されるため、
+// 保存時は field 単位で差し替える（説明だけ保存しても顛末の宛先を巻き込まない）= 複合主キーに field を含める。
+
+// タスク本文のどの面に紐づくメンションか（説明 / 顛末）。複合主キーに含め、面ごとの独立保存を可能にする。
+enum TaskMentionField {
+  DESCRIPTION
+  TENMATSU
+}
+
+model TaskMention {
+  taskId    Int              @map("task_id")
+  accountId String           @map("account_id")
+  field     TaskMentionField
+
+  // onDelete: Cascade — タスク削除で宛先行も消える（タスク付帯情報・ChatThemeMention と同方針）。
+  task    Task    @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  // onDelete: Restrict — 宛先履歴が残る限りアカウントを削除できない（ChatThemeMention と同方針）。
+  account Account @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@id([taskId, accountId, field])
+  // To 逆引き（「自分宛」「特定ユーザー宛」フィルタ）+ Account 削除時 Restrict 逆 JOIN の index。
+  @@index([accountId])
+  @@map("task_mentions")
+}
+
+// ============================================================
+// TaskCommentMention (タスクコメント → メンション先アカウントの多対多 join / dsk-0203)
+// ============================================================
+//
+// チャット側 ChatMessageMention（rete-desk-0049）のタスクコメント版。1 コメントは複数アカウントを
+// 宛先（To）に指定できる。From は TaskComment.authorId（投稿者）。
+model TaskCommentMention {
+  commentId String @map("comment_id")
+  accountId String @map("account_id")
+
+  // onDelete: Cascade — コメント削除でそのメンション行も消える（発話の付帯情報・ChatMessageMention と同方針）。
+  comment TaskComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  // onDelete: Restrict — メンション履歴が残る限りアカウントを削除できない（ChatMessageMention と同方針）。
+  account Account     @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@id([commentId, accountId])
+  // To 逆引き（「自分宛」「特定ユーザー宛」フィルタ）の index。
+  @@index([accountId])
+  @@map("task_comment_mentions")
+}
+
+// ============================================================
+// Account (テナント内 identity の SoT — Rete=OIDC IdP のユーザー)
+// ============================================================
+//
+// id は OIDC の sub（subject）として外部 RP に渡るため、推測可能な autoincrement int を避け uuid とする。
+// membership / role / team / system は後フェーズ（最小スライスでは email + password でログインできる最小構造）。
+
+model Account {
+  id                  String    @id @default(uuid())
+  email               String    @unique
+  passwordHash        String    @map("password_hash")
+  name                String
+  // 姓・名（set-0096）。name は表示名（familyName + givenName を半角スペース連結で再組み立て）として温存。
+  // 既存のチャット投稿者・監査・OIDC name claim・CSV 等は name 列を読むため無改修のまま動く。
+  familyName          String    @default("") @map("family_name")
+  givenName           String    @default("") @map("given_name")
+  // テナント内ロール（RBAC 最小核）。既定 MEMBER。掲示板の変更系は ADMIN のみ（Roles ガードで enforce）。
+  // membership/team/system 等のより細かい権限は後フェーズ（ST-3 RBAC）。
+  role                Role      @default(MEMBER)
+  // ロック状態（false=ロック / ログイン不可）。メンバー管理（ST-4）の「ロック/解除」はこの列を反転する
+  // （新 locked 列は作らず既存の認証境界=isActive を流用。lock は即時有効で H4 enforcement を待たない）。
+  isActive            Boolean   @default(true) @map("is_active")
+  // 強制パスワード変更マーク（set-0035 で再導入・現役）。true の間、PasswordChangeEnforcementGuard が
+  // 保護ルートを 403 PASSWORD_CHANGE_REQUIRED で遮断し、フロントの横断ゲート（AppShell）が業務操作を
+  // ブロックしてパスワード変更画面へ誘導する。AuthService.changePassword 完了時の
+  // AccountRepository.updatePasswordAndClearFlag で hash 更新と同一 UPDATE 内で false へ落ちる。
+  // SELECT 側（members.repository 等）は select allowlist で意図的に出さない（内部フラグ）。
+  mustChangePassword  Boolean   @default(false) @map("must_change_password")
+  // ログイン試行ロックアウト（H6 / brute-force 防御）。失敗の連続回数を保持し、閾値到達で lockedUntil を立てる。
+  // DB 保持により再起動跨ぎ・複数インスタンスで一貫する（in-memory レート制限と異なり IP 変更で回避できない）。
+  // ログイン成功・ロック期限切れ後の再試行でリセットされる。
+  failedLoginAttempts Int       @default(0) @map("failed_login_attempts")
+  // ロック解除時刻（null=ロックなし）。これ以降の時刻になればロック解除。
+  lockedUntil         DateTime? @map("locked_until") @db.Timestamptz
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  // チャットの投稿者は Account へ正規化（FK）。改名・無効化に追従でき、表示名文字列の重複を持たない。
+  chatThemes               ChatTheme[]
+  chatMessages             ChatMessage[]
+  // 押したリアクション（テーマ／メッセージ両対象）。
+  reactions                Reaction[]
+  // このアカウントを宛先（To）に指定したメンション（rete-desk-0049）。Account 削除は Restrict で保護。
+  chatMentions             ChatMessageMention[]
+  // テーマ（説明/顛末）の宛先に指定されたメンション（rete-desk-0116）。Account 削除は Restrict で保護。
+  chatThemeMentions        ChatThemeMention[]
+  // テーマごとの最終既読時刻（未読判定の実データ / rete-desk-0075）。Account 削除で Cascade（派生データ）。
+  chatReadStates           ChatReadState[]
+  // ファイル版のアップロード者も Account へ正規化（chat と同方針）。
+  fileVersions             FileVersion[]
+  // 投稿した掲示板通知。投稿者は Account へ正規化（FK）。
+  announcements            Announcement[]
+  // 通知ごとの既読マーカー（未読判定の実データ / HM-3・ADR 0029）。Account 削除で Cascade（派生データ）。
+  announcementReadStates   AnnouncementReadState[]
+  // 作成した Desk 添付（FL-3）。添付者も Account へ正規化（onDelete:Restrict で帰属保護）。
+  attachments              Attachment[]
+  // 担当しているタスク（rete-desk-0062）。Account 削除で Task.assigneeId は SetNull（タスクは残る）。
+  assignedTasks            Task[]
+  // 作成した（所有する）タスク（H4 所有者 enforcement）。Account 削除で Task.ownerId は SetNull（タスクは残る）。
+  ownedTasks               Task[]                    @relation("TaskOwner")
+  // 投稿したタスクコメント（dsk-0216）。コメントが残る限り Account を消せない（onDelete: Restrict・ChatMessage と同方針）。
+  taskComments             TaskComment[]
+  // 実行したタスク属性変更の監査ログ（dsk-0223）。Account 削除で TaskActivity.actorAccountId は SetNull（記録は残る）。
+  // Account は既に Task へ複数リレーションを持つため named relation で曖昧さを解消する。
+  taskActivities           TaskActivity[]            @relation("TaskActivityActor")
+  // タスク説明/顛末の宛先に指定されたメンション（dsk-0203）。Account 削除は Restrict で保護。
+  taskMentions             TaskMention[]
+  // タスクコメントの宛先に指定されたメンション（dsk-0203）。Account 削除は Restrict で保護。
+  taskCommentMentions      TaskCommentMention[]
+  // Desk UI の個人設定（ペイン幅比率 / rete-desk-0142）。Account 削除で Cascade（派生データ）。
+  deskPreference           DeskPreference?
+  // 表示個人設定（明細の縞模様 / mdl-0022）。Account 削除で Cascade（個人の派生データ）。
+  displayPreference        DisplayPreference?
+  // HOME サイドバーの横断お気に入り（HM-1）。Account 削除で Cascade（個人の派生データ）。
+  userFavorites            UserFavorite[]
+  // Desk 個人タブの宛先グルーピング（dsk-0304・dsk-0305）。Account 削除で Cascade（個人の派生データ）。
+  deskGroupClassifications DeskGroupClassification[]
+  deskGroups               DeskGroup[]
+  deskGroupMembers         DeskGroupMember[]
+  // この実行者の操作ログ（ST-6）。Account 削除で actorAccountId は SetNull（ログ自体は actor スナップショットで残す）。
+  auditLogs                AuditLog[]
+  // スコープ付きメンバーシップ（CM-2 / ADR 0037）。Account 削除で Cascade（メンバーシップは派生）。
+  memberships              Membership[]
+  // 所属するユーザーグループ（set-0164）。Account 削除で Cascade（派生 join 行）。
+  userGroupMembers         UserGroupMember[]
+  // 所有する個人スペース（PERSONAL_MEMO/DM の owner）。Account 削除で Cascade（個人の器）。
+  ownedSpaces              Space[]                   @relation("SpaceOwner")
+  // 相手として参加する 1:1 スペース（PERSONAL_DM の peer）。Account 削除で Cascade。
+  peeredSpaces             Space[]                   @relation("SpacePeer")
+  // 招待（ST-5）。Account 削除で Cascade（発行者アカウントが消えたら招待も消す）。
+  invites                  Invite[]
+  // MFA/TOTP 設定（ST-2-2・1:1）。Account 削除で Cascade（認証派生データ）。
+  mfaSetting               MfaSetting?
+  // MFA バックアップコード（single-use・ST-2-2）。Account 削除で Cascade。
+  mfaBackupCodes           MfaBackupCode[]
+  // 列幅個人設定（fil-0047）。Account 削除で Cascade（個人の派生データ）。
+  tableColumnWidths        UserTableColumnWidth[]
+  // 作成したフォルダ（fil-0027・作成者の暗黙 MANAGE）。Account 削除で Folder.createdById は SetNull。
+  createdFolders           Folder[]                  @relation("FolderCreator")
+
+  // 担当者候補などの「名前順」並べ替えをヒープソートでなく index scan にする（rete-backend-0002 / dsk-0211 db-reviewer HIGH）。
+  // is_active=true 限定の部分 index は Prisma schema で表現できないため migration SQL 手書き（accounts_active_idx）。
+  @@index([name])
+  @@map("accounts")
+}
+
+// ============================================================
+// Invite（招待管理 ST-5）
+// ============================================================
+//
+// セキュリティ方針: 生 token は DB に保存しない（sha256 ハッシュのみ）。
+// メールリンクに生 token を載せ、受諾時に sha256 して tokenHash と照合する。
+// 有効期間は 7 日間（INVITE_TTL_MS）。effective status は PENDING + expiresAt 超過 → EXPIRED。
+// Account 作成 + Invite ACCEPTED への更新は単一トランザクション（$transaction）で原子的に実行する。
+
+model Invite {
+  id             String       @id @default(uuid())
+  email          String
+  status         InviteStatus @default(PENDING)
+  // 生 token の sha256 hex。受諾時に受信トークンを sha256 して照合する。生 token は保存も log もしない。
+  tokenHash      String       @unique @map("token_hash")
+  expiresAt      DateTime     @map("expires_at") @db.Timestamptz
+  invitedById    String       @map("invited_by_id")
+  acceptedAt     DateTime?    @map("accepted_at") @db.Timestamptz
+  // 受諾時に追加する GROUP Space（ST-5 論点1）。Space 削除で SetNull（招待は残す）。null の旧招待はスキップ。
+  spaceId        String?      @map("space_id")
+  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime     @updatedAt @map("updated_at") @db.Timestamptz
+
+  invitedBy    Account         @relation(fields: [invitedById], references: [id], onDelete: Cascade)
+  // onDelete: SetNull — Space 削除で招待の spaceId を null 化（招待自体は残す）。
+  invitedSpace Space?          @relation(fields: [spaceId], references: [id], onDelete: SetNull)
+
+  @@index([invitedById])
+  // email + status の複合インデックス（一覧/重複チェッククエリの性能）。
+  // PENDING の email 重複は partial unique（SQL 手書き: invites_pending_email_unique）で DB 側保証。
+  @@index([email, status])
+  @@index([spaceId])
+  @@map("invites")
+}
+
+// HOME サイドバーの横断お気に入り（HM-1）。アカウント別の可変リスト。kind（system/chat/task/file）で
+// 対応サブシステムを区別し、targetRef で対象リソースを参照する（manual 追加時は合成 id）。
+// kind は @rete/shared FAVORITE_KINDS の文字列 union を String 列で保持（DB enum は採らない / shared が SSOT）。
+model UserFavorite {
+  id        String   @id @default(uuid())
+  accountId String   @map("account_id")
+  // お気に入り種別（'system' | 'chat' | 'task' | 'file'）。値域は @rete/shared FAVORITE_KINDS。
+  kind      String
+  // 対象リソースの参照キー。kind により意味が変わる（chat=themeId / task=taskId / file=fileId / system=画面キー）。
+  targetRef String   @map("target_ref")
+  // サイドバー表示ラベル（ユーザーが見る名前）。
+  label     String
+  // 表示順（昇順）。reorder で配列 index に更新する。
+  sortOrder Int      @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  // 同一ユーザーが同一リソース（kind+targetRef）を重複登録できない（★トグルの冪等性の土台）。
+  @@unique([accountId, kind, targetRef])
+  // 個人のお気に入り一覧（accountId 絞り + sortOrder 昇順）の主クエリに効く。
+  @@index([accountId, sortOrder])
+  @@map("user_favorites")
+}
+
+// Desk 個人タブの宛先グルーピング（dsk-0304・dsk-0305）。2階層: グループ分類 ⊃ グループ ⊃ 宛先(DM/自分メモ)。
+// ユーザー単位（accountId）で管理する軽量・順序付きモデル（UserFavorite と同方針）。ネストはこの2階層限定
+// （グループ分類の下にグループ分類は作れない・グループの下にグループは作れない）。
+// SpaceKind.GROUP（Membership経由の複数人チャットの器）とは別モデル・別テーブル。
+model DeskGroupClassification {
+  id        String   @id @default(uuid())
+  accountId String   @map("account_id")
+  name      String
+  sortOrder Int      @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  account Account     @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  groups  DeskGroup[]
+
+  @@unique([accountId, name])
+  @@index([accountId, sortOrder])
+  @@map("desk_group_classifications")
+}
+
+model DeskGroup {
+  id               String   @id @default(uuid())
+  accountId        String   @map("account_id")
+  name             String
+  // 所属するグループ分類（null=どのグループ分類にも属さない）。
+  // onDelete: Restrict — Category と同方針。所属グループが残る限りグループ分類は削除不可（app 層 409）。
+  classificationId String?  @map("classification_id")
+  sortOrder        Int      @map("sort_order")
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  account        Account                  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  classification DeskGroupClassification? @relation(fields: [classificationId], references: [id], onDelete: Restrict)
+  members        DeskGroupMember[]
+
+  @@unique([accountId, name])
+  @@index([accountId, classificationId, sortOrder])
+  @@index([classificationId])
+  @@map("desk_groups")
+}
+
+model DeskGroupMember {
+  id        String   @id @default(uuid())
+  accountId String   @map("account_id")
+  groupId   String   @map("group_id")
+  // 対象宛先の参照キー（Space.id = DM相手/自分メモ）。
+  targetRef String   @map("target_ref")
+  sortOrder Int      @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  account Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  group   DeskGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  // 同一ユーザーが同一宛先を複数グループへ重複登録できない（1宛先=1グループ排他）。
+  @@unique([accountId, targetRef])
+  @@index([groupId, sortOrder])
+  // dsk-0330 MEDIUM3: DeskGroupClassification の @@index([accountId, sortOrder]) と形状を揃え、
+  // findMembers(accountId) の WHERE + ORDER BY sortOrder 昇順（一覧描画のホットパス）を index で支
+  // える。DeskGroup 本体は @@index([accountId, classificationId, sortOrder]) の 3 列なので alignment
+  // 元ではない（コメント誤読を避けるため DeskGroup への言及は外した）。index-only scan を意味する
+  // わけではない（select * 経路は heap fetch を行う）点にも注意。
+  @@index([accountId, sortOrder])
+  @@map("desk_group_members")
+}
+
+// Desk UI の個人設定（rete-desk-0142）。アカウント 1:1 で、デバイスを跨いで持ち回りたい表示設定を
+// 型付き列で持つ（JSON blob は型安全と検証を失うため不採用）。設定が増えたら列を足す。
+model DeskPreference {
+  accountId     String   @id @map("account_id")
+  // 左ペイン幅の比率（0.25〜0.75 / シェル全幅に対する割合）。右ペインは残り（1 - leftPaneRatio）。
+  leftPaneRatio Float    @map("left_pane_ratio")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@map("desk_preferences")
+}
+
+// 表示個人設定（明細の縞模様 / mdl-0022）。DeskPreference と同じ「アカウント 1:1・型付き列」方式
+// （JSON blob は型安全と検証を失うため不採用。表示設定が増えたら列を足す）。
+model DisplayPreference {
+  accountId     String   @id @map("account_id")
+  // 明細（テーブル/一覧）の縞模様を表示するか。OFF はログイン時に --sp-row-stripe を transparent 化。
+  stripeEnabled Boolean  @default(true) @map("stripe_enabled")
+  // 縞模様の色（#RRGGBB 6 桁 hex・DTO で形式検証）。既定は CSS トークン --sp-row-stripe と同値。
+  stripeColor   String   @default("#FAFCFF") @map("stripe_color") @db.VarChar(7)
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@map("display_preferences")
+}
+
+// ============================================================
+// CM-2: 組織モデル（管理対象3層）— Organization / Project / Space / Membership
+// ============================================================
+//
+// 設計正本: docs/discover/specs/2026-06-14-cm2-org-model-design.md / ADR 0037（統一 Space モデル）。
+// 管理対象3層 = 組織 | グループ | 個人。組織階層は 組織＞プロジェクト＞チャネル＞{チャット明細＋タスク明細}。
+// チャネル/グループ/個人メモ/1:1 は全て「二ペインの器」＝単一 Space テーブルに kind で吸収する。
+// 可視範囲＝器のメンバーシップ1階層（ScopeVisibilityService がクエリ時に解決・H4 とは別レイヤ）。
+
+// 組織エントリ（公的に認めた単位・事業部/公式部署）。組織管理者のみ作成。desk★ の favoritable 対象。
+model Organization {
+  id         String    @id @default(uuid())
+  name       String
+  // 同一階層内の表示順（Category.sortOrder と同方針）。
+  sortOrder  Int       @default(0) @map("sort_order")
+  // アーカイブ時刻。非 null = アーカイブ済（物理削除しない / archivedAt 畳み込みで archived へ）。
+  archivedAt DateTime? @map("archived_at") @db.Timestamptz
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  // 配下プロジェクト。組織削除で Cascade（配下ごと消える / 通常は archivedAt ソフト削除）。
+  projects Project[]
+
+  @@index([sortOrder])
+  @@map("organizations")
+}
+
+// プロジェクト（組織配下）。組織管理者のみ作成。配下にチャネル（Space kind=CHANNEL）を持つ。favoritable。
+model Project {
+  id             String    @id @default(uuid())
+  organizationId String    @map("organization_id")
+  name           String
+  sortOrder      Int       @default(0) @map("sort_order")
+  archivedAt     DateTime? @map("archived_at") @db.Timestamptz
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  // onDelete: Cascade — 組織削除で配下プロジェクトも消える。
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  // 配下チャネル（Space kind=CHANNEL）。プロジェクト削除で Cascade。
+  channels     Space[]
+
+  @@index([organizationId, sortOrder])
+  @@map("projects")
+}
+
+// 器（Space）= 二ペイン（チャット明細＋タスク明細）の単位。kind で4種を吸収（ADR 0037）。
+// kind ごとの列の有無は判別共用体で、手書き CHECK 制約 space_kind_shape（migration SQL）で担保する
+// （prisma schema では表現不可・db push / baseline 再採番で脱落し得るので migration SQL を参照）:
+//   CHANNEL       → projectId 必須 / ownerId・peerAccountId null
+//   GROUP         → 全 null（メンバーは Membership scopeType=GROUP）
+//   PERSONAL_MEMO → ownerId 必須 / projectId・peerAccountId null
+//   PERSONAL_DM   → ownerId + peerAccountId 必須 / projectId null（無向ペア重複防止は app 層 cross-check）
+model Space {
+  id            String    @id @default(uuid())
+  kind          SpaceKind
+  // CHANNEL のみ非 null（所属プロジェクト）。onDelete: Cascade — プロジェクト削除で配下チャネルも消える。
+  projectId     String?   @map("project_id")
+  // PERSONAL_MEMO / PERSONAL_DM のみ非 null（所有者）。onDelete: Cascade — 所有者削除で個人スペースも消える。
+  ownerId       String?   @map("owner_id")
+  // PERSONAL_DM のみ非 null（1:1 の相手）。onDelete: Cascade — 相手削除で DM スペースも消える。
+  peerAccountId String?   @map("peer_account_id")
+  name          String
+  sortOrder     Int       @default(0) @map("sort_order")
+  archivedAt    DateTime? @map("archived_at") @db.Timestamptz
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  project    Project?    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  owner      Account?    @relation("SpaceOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  peer       Account?    @relation("SpacePeer", fields: [peerAccountId], references: [id], onDelete: Cascade)
+  // この器に属すチャット明細（テーマ群）とタスク明細、分類（rete-desk-0158・Space スコープ）。
+  chatThemes ChatTheme[]
+  tasks      Task[]
+  categories Category[]
+  // この器のファイルリポジトリ（ADR 0063）。onDelete: Restrict — folder が残る器は削除できない。
+  folders    Folder[]
+
+  // この器を指定した招待（ST-5 論点1）。Space 削除で Invite.spaceId は SetNull。
+  invites Invite[]
+
+  // プロジェクト配下チャネル一覧（projectId 絞り → sortOrder）。projectId null（group/personal）は本 index 非該当。
+  @@index([projectId, sortOrder])
+  // 個人スペースの逆引き（owner==self の自分メモ/DM 解決）。
+  @@index([ownerId])
+  // 1:1 の相手側からの逆引き（peerAccountId==self の DM 解決）。
+  @@index([peerAccountId])
+  @@map("spaces")
+}
+
+// メンバーシップ（ユーザー × スコープ × ロール / ADR 0037）。scopeId は scopeType により
+// Organization.id / Project.id / Space.id(kind=GROUP) を指すポリモーフィック参照（FK は張らない・
+// 先例 AuditLog.systemId）。実在 cross-check と器 archive 時の整理は app 層（MembershipService）の責務。
+// 個人（PERSONAL_MEMO/DM）はここに乗せない（Space.ownerId/peerAccountId 直参照で可視解決）。
+model Membership {
+  id        String              @id @default(uuid())
+  accountId String              @map("account_id")
+  scopeType MembershipScopeType @map("scope_type")
+  scopeId   String              @map("scope_id")
+  // スコープ内ロール（システム Role enum を流用・ADMIN=その器の管理者 / MEMBER=一般）。
+  role      Role                @default(MEMBER)
+  createdAt DateTime            @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime            @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  // onDelete: Cascade — アカウント削除でメンバーシップも消える（派生）。
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  // 同一アカウントが同一スコープに二重所属できない（招待の冪等性の土台）。
+  @@unique([accountId, scopeType, scopeId])
+  // スコープ起点のメンバー一覧（scopeType+scopeId 絞り）と、可視解決の「自分の所属器」引き（accountId）に効く。
+  @@index([scopeType, scopeId])
+  @@index([accountId])
+  @@map("memberships")
+}
+
+// ユーザーグループ（set-0164）。ユーザーを束ね、組織/PJ/チャネルへのロール付き所属（grant）を
+// 一括設定するための器。チャット用グループ（Space kind=GROUP）とは別系統（器モデル汚染防止）。
+// scopeId は Membership と同じポリモーフィック参照方式（FK は張らない・実在 cross-check は app 層）。
+model UserGroup {
+  id         String    @id @default(uuid())
+  name       String
+  sortOrder  Int       @default(0) @map("sort_order")
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  members UserGroupMember[]
+  grants  UserGroupScopeGrant[]
+
+  @@map("user_groups")
+}
+
+// ユーザーグループのメンバー（グループに束ねるユーザー）。
+model UserGroupMember {
+  id        String   @id @default(uuid())
+  groupId   String   @map("group_id")
+  accountId String   @map("account_id")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations（アカウント削除で Cascade・派生 join 行）
+  group   UserGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  account Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  // 同一グループへの二重所属を防ぐ（membership の先例と同じ冪等性の土台）。
+  @@unique([groupId, accountId])
+  // アカウント起点の「所属グループ一覧」（実効ロール解決で grant を引き当てる）。
+  @@index([accountId])
+  @@map("user_group_members")
+}
+
+// ユーザーグループ → 組織/PJ/チャネルへのロール付き所属（grant）。加算 OR で既存 membership と合算される。
+// scopeType は共有 MembershipScopeType 列を使用（ORGANIZATION/PROJECT/CHANNEL のみ許可）。
+// scopeId は Organization.id / Project.id / Space.id(kind=CHANNEL) を指すポリモーフィック参照。
+model UserGroupScopeGrant {
+  id        String              @id @default(uuid())
+  groupId   String              @map("group_id")
+  scopeType MembershipScopeType @map("scope_type")
+  scopeId   String              @map("scope_id")
+  // スコープ内ロール（システム Role enum を流用・Membership と同じ）。ADMIN=管理者 / MEMBER=一般。
+  role      Role                @default(MEMBER)
+  createdAt DateTime            @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  group UserGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  // 同一グループが同一スコープへ二重 grant できない。
+  @@unique([groupId, scopeType, scopeId])
+  // スコープ起点の「この組織/PJ/チャネルに grant を持つグループ一覧」（可視解決・全消失ガードで使用）。
+  @@index([scopeType, scopeId])
+  @@map("user_group_scope_grants")
+}
+
+// ============================================================
+// OidcPayload (node-oidc-provider の汎用ストレージ — Adapter 経由)
+// ============================================================
+//
+// oidc-provider の全 model（Session / AccessToken / AuthorizationCode / RefreshToken /
+// Grant / Interaction / Client 等）を 1 テーブルに type 別で保存する。公式 example の
+// Redis / Mongo adapter と同じ単一ストア方式。Adapter は type ごとにインスタンス化され、
+// modelId は type 内で一意（複合 unique [type, modelId]）。
+
+model OidcPayload {
+  id         String    @id @default(uuid())
+  type       String
+  modelId    String    @map("model_id")
+  payload    Json
+  grantId    String?   @map("grant_id")
+  userCode   String?   @map("user_code")
+  uid        String?
+  expiresAt  DateTime? @map("expires_at") @db.Timestamptz
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  @@unique([type, modelId])
+  @@index([grantId])
+  @@index([userCode])
+  @@index([type, uid])
+  @@map("oidc_payloads")
+}
+
+// ============================================================
+// Session (express-session 永続ストア — connect-pg-simple)
+// ============================================================
+//
+// Rete 自身のログイン session（passport）を MemoryStore から PostgreSQL に永続化する（DBT-8 / ADR 0010）。
+// 列構成は connect-pg-simple が要求する固定スキーマ（sid / sess / expire）に厳密一致させる。
+// `createTableIfMissing: false` で起動するため、このテーブルは Prisma migration が作成する。
+// OIDC provider 側の session/grant（OidcPayload）とは別系統。
+
+model Session {
+  sid    String   @id
+  sess   Json     @db.Json
+  expire DateTime @db.Timestamp(6)
+
+  @@index([expire], map: "IDX_session_expire")
+  @@map("session")
+}
+
+// ============================================================
+// Chat: Theme / Message (Desk のチャット — テーマ＝タイトル付きスレッド前提)
+// ============================================================
+//
+// チャットは「テーマ（タイトル付きスレッド）」を主役に設計する（流れる無題雑談ではない）。
+// 投稿者は Account への FK（assigneeName のような表示名文字列ではなく正規化）。
+// lastMessageAt はテーマ一覧の最新順ソート用の非正規化列。メッセージ投稿時に同一 tx で更新する。
+
+model ChatTheme {
+  id            String          @id @default(uuid())
+  title         String
+  description   String?
+  // 顛末（てんまつ）= スレッドの結論・決定事項。タスク詳細の顛末（Task.tenmatsu）と対の自由記入ノート。
+  // チャットテーマは status=DONE 必須化が無いため完了ゲートは持たない。NULL = 未記入（rete-desk-0092）。
+  tenmatsu      String?
+  status        ChatThemeStatus @default(OPEN)
+  authorId      String          @map("author_id")
+  // 所属する器（CM-2 / ADR 0037）。移行②で既存テーマは DEFAULT_CHANNEL_ID へ backfill。nullable は移行期のため
+  // （新規は app 層で必須化）。器削除で Cascade（テーマはその器に属す）。
+  spaceId       String?         @map("space_id")
+  lastMessageAt DateTime        @default(now()) @map("last_message_at") @db.Timestamptz
+  // アーカイブ時刻。NULL = 非アーカイブ（archived=false）/ 非 NULL = アーカイブ済（archived=true）。
+  // boolean フラグではなく「いつアーカイブしたか」を保持し、レスポンスでは archivedAt != null を archived へ畳む。
+  archivedAt    DateTime?       @map("archived_at") @db.Timestamptz
+  createdAt     DateTime        @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime        @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  // onDelete: Restrict — テーマを残したまま投稿者 Account を消せない（発言の帰属を保護）。
+  author        Account            @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  // 所属する器（CM-2）。onDelete: Cascade — 器削除でそのテーマも消える。
+  space         Space?             @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  messages      ChatMessage[]
+  // テーマ起点カードに付いたリアクション。
+  reactions     Reaction[]
+  // このテーマ（新規作成時コンポーザ／編集モード）に添付されたファイル（Desk 添付 FL-3b）。
+  // テーマ削除で添付も Cascade 消去。
+  attachments   Attachment[]
+  // このテーマから昇格したタスク群（チャット→タスク昇格の逆リレーション）。
+  promotedTasks Task[]             @relation("ThemePromotedTasks")
+  // 各アカウントの最終既読時刻（未読判定 / rete-desk-0075）。テーマ削除で Cascade。
+  readStates    ChatReadState[]
+  // このテーマの説明/顛末に付いたメンション宛先（rete-desk-0116）。テーマ削除で Cascade。
+  mentions      ChatThemeMention[]
+
+  // 複合 index: テーマ一覧の主クエリ（status 等値フィルタ → lastMessageAt 降順ソート + pagination）に効く。
+  // 単独 [status] は leftmost prefix で本複合がカバーするため不要。[lastMessageAt] 単独は status 無し
+  // （全件最新順）クエリ用に残す。
+  @@index([status, lastMessageAt])
+  @@index([lastMessageAt])
+  @@index([authorId])
+  // 器スコープのテーマ一覧（spaceId 絞り → lastMessageAt 降順）の主クエリに効く（CM-2・スライスBで作動）。
+  @@index([spaceId, lastMessageAt])
+  // 顛末フィルタ（tenmatsuOnly / rete-desk-0050 を server 化）の WHERE tenmatsu IS NOT NULL 用。
+  // 本来は partial index（WHERE NOT NULL）が理想だが Prisma が schema 表現できず drift するため、
+  // Prisma 管理の通常 index とする（Postgres は IS NOT NULL 絞り込みに本 index を利用可能 / DBT-11）。
+  @@index([tenmatsu])
+  // cmn-0186(開発エージェント): テーマ検索（title / description / messages.body の 3 条件 OR・ILIKE '%q%'）を seq scan に
+  // 落とさない pg_trgm GIN index（files / folders / audit_logs と同方針）。CREATE EXTENSION pg_trgm は
+  // migration 先頭で発行。3 条件の各列に単一列 GIN を張り BitmapOr で束ねる。
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([description(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@map("chat_themes")
+}
+
+model ChatMessage {
+  id        String   @id @default(uuid())
+  themeId   String   @map("theme_id")
+  authorId  String   @map("author_id")
+  body      String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  // onDelete: Cascade — テーマ削除でそのスレッドの全メッセージも消える。
+  theme       ChatTheme            @relation(fields: [themeId], references: [id], onDelete: Cascade)
+  // onDelete: Restrict — 発言が残る限り投稿者 Account を消せない。
+  author      Account              @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  // この発話に付いたリアクション。
+  reactions   Reaction[]
+  // この発話に添付されたファイル（Desk 添付 FL-3）。メッセージ削除で添付も Cascade 消去。
+  attachments Attachment[]
+  // この発話のメンション先（@誰宛て / rete-desk-0049）。多対多 join。メッセージ削除で Cascade 消去。
+  mentions    ChatMessageMention[]
+
+  // themeId 先頭の複合インデックス。themeId 単独ルックアップ（FK CASCADE / 本文検索の messages.some）を
+  // 兼ねつつ、未読集約（rete-desk-0075）の groupBy「WHERE theme_id IN (...) AND author_id != self
+  // GROUP BY theme_id, MAX(created_at)」を covering 化しヒープ参照を不要にする（チャット一覧の毎リクエスト
+  // ホットパス）。themeId 単独 index は本複合の最左プレフィクスで包含されるため別途持たない。
+  @@index([themeId, authorId, createdAt])
+  @@index([authorId])
+  // cmn-0186(開発エージェント): スレッド本文の部分一致検索（テーマ検索 3 条件 OR の messages.some）用 pg_trgm GIN index。
+  @@index([body(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@map("chat_messages")
+}
+
+// ============================================================
+// ChatMessageMention (メッセージ → メンション先アカウントの多対多 join / rete-desk-0049)
+// ============================================================
+//
+// 1 メッセージは複数アカウントを宛先（To）に指定できる。From は ChatMessage.authorId（発信者）。
+// チャット明細の From/To フィルタは本 join を起点に「From 内 OR / To 内 OR / From×To 同一メッセージ AND」で
+// 判定する（サーバー絞り込み）。タスク側は TaskMention / TaskCommentMention（dsk-0203）が同型の join を担う
+// （タスク側にはメッセージ実体が無いため、テーマ本文相当＝タスク本文（TaskMention）とコメント（TaskCommentMention）に分岐）。
+model ChatMessageMention {
+  messageId String @map("message_id")
+  accountId String @map("account_id")
+
+  // onDelete: Cascade — メッセージ削除でそのメンション行も消える（発話の付帯情報）。
+  message ChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  // onDelete: Restrict — メンション履歴が残る限りアカウントを削除できない。既存の発言帰属
+  // （ChatMessage.authorId も Restrict）と同方針で非対称を作らない（rete-desk-0049 確定）。
+  account Account     @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@id([messageId, accountId])
+  // To 逆引き（「自分宛」「特定ユーザー宛」フィルタ）の index。
+  @@index([accountId])
+  @@map("chat_message_mentions")
+}
+
+// ============================================================
+// ChatThemeMention (テーマの説明/顛末 → メンション先アカウントの多対多 join / rete-desk-0116)
+// ============================================================
+//
+// テーマ本文（説明=DESCRIPTION / 顛末=TENMATSU）ごとに宛先（To）を保持する。ChatMessageMention の
+// テーマ版で、From=ChatTheme.authorId（起票者）。説明・顛末は独立した update で別々に保存されるため、
+// 保存時は field 単位で差し替える（説明だけ保存しても顛末の宛先を巻き込まない）= 複合主キーに field を含める。
+// Phase A は DESCRIPTION のみ書き込み、TENMATSU は後続フェーズ（顛末メンション）で配線する
+// （スキーマは将来面を一度の migration で作り、再採番を避ける設計判断 / rete-desk-0116 方針メモ）。
+
+// テーマ本文のどの面に紐づくメンションか（説明 / 顛末）。複合主キーに含め、面ごとの独立保存を可能にする。
+enum ChatThemeMentionField {
+  DESCRIPTION
+  TENMATSU
+}
+
+model ChatThemeMention {
+  themeId   String                @map("theme_id")
+  accountId String                @map("account_id")
+  field     ChatThemeMentionField
+
+  // onDelete: Cascade — テーマ削除で宛先行も消える（テーマ付帯情報・ChatMessageMention と同方針）。
+  theme   ChatTheme @relation(fields: [themeId], references: [id], onDelete: Cascade)
+  // onDelete: Restrict — 宛先履歴が残る限りアカウントを削除できない（ChatMessageMention と同方針）。
+  account Account   @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@id([themeId, accountId, field])
+  // To 逆引き（「自分宛」「特定ユーザー宛」フィルタ）+ Account 削除時 Restrict 逆 JOIN の index。
+  @@index([accountId])
+  @@map("chat_theme_mentions")
+}
+
+// ============================================================
+// ChatReadState (テーマ × アカウントの最終既読時刻 / rete-desk-0075)
+// ============================================================
+//
+// 未読判定の実データ。未読 = 「自分以外の活動（テーマ起票 or 投稿）が lastReadAt より後に存在する」。
+// 既読行が無い = 一度も開いていない（epoch 起点で全ての他者活動が未読）。チャット詳細を開いた時に upsert する。
+// 自分起票/自分投稿は未読に数えない（集約クエリ側で authorId != self を課すことで担保 / 旧 sampleUnread 擬似値を返済）。
+model ChatReadState {
+  accountId  String   @map("account_id")
+  themeId    String   @map("theme_id")
+  lastReadAt DateTime @default(now()) @map("last_read_at") @db.Timestamptz
+
+  // onDelete: Cascade — 既読状態は派生データのため、アカウント／テーマ削除で一緒に消える。
+  account Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  theme   ChatTheme @relation(fields: [themeId], references: [id], onDelete: Cascade)
+
+  @@id([accountId, themeId])
+  // 未読集約（findThemesAndCount の既読時刻引き）の WHERE accountId + themeId IN (...) に効く。
+  @@index([themeId])
+  @@map("chat_read_states")
+}
+
+// ============================================================
+// Reaction (テーマ／メッセージ両対応の絵文字リアクション)
+// ============================================================
+//
+// リアクション対象はテーマ起点カード（ChatTheme）・スレッド内の発話（ChatMessage）・タスクコメント
+// （TaskComment / dsk-0297）・タスク起点カード（Task / dsk-0297 起点カード対応）の4択。
+// messageId / themeId / taskCommentId / taskId は「ちょうど一つが非 NULL」という排他制約（XOR）を持つ。
+// これは Prisma schema では表現できないため、migration SQL に CHECK 制約 reaction_target_xor を手書きで追加している。
+// 絵文字値は @rete/shared の REACTION_EMOJI_RE を SSOT とし、app 層（CreateReactionDto の @Matches）で強制する。
+// 同一ユーザー・同一対象・同一絵文字の二重付与は複合 unique で防ぐ（対象種別ごとに別 unique で）。
+//
+// 運用ルール: reactions / attachments のようなテーブルへの CHECK 制約追加で、行数が増えた際の
+// ACCESS EXCLUSIVE ロック長時間化対応（NOT VALID + VALIDATE CONSTRAINT の 2 段構成切替）は
+// docs/architecture/operational-policy.md §11 を正本とする（schema 側に書き写さない＝SSOT 維持）。
+
+model Reaction {
+  id            String   @id @default(uuid())
+  messageId     String?  @map("message_id")
+  themeId       String?  @map("theme_id")
+  taskCommentId String?  @map("task_comment_id")
+  taskId        Int?     @map("task_id")
+  authorId      String   @map("author_id")
+  emoji         String
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  // onDelete: Cascade — 対象メッセージ／テーマ／タスクコメント／タスク削除でそのリアクションも消える。
+  message     ChatMessage? @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  theme       ChatTheme?   @relation(fields: [themeId], references: [id], onDelete: Cascade)
+  taskComment TaskComment? @relation(fields: [taskCommentId], references: [id], onDelete: Cascade)
+  task        Task?        @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  // onDelete: Restrict — リアクションが残る限り押した Account を消せない（chat と同方針）。
+  author      Account      @relation(fields: [authorId], references: [id], onDelete: Restrict)
+
+  // 二重付与防止（NULL 行同士は等値比較されないため対象種別ごとに別 unique を張る）。
+  // 注意: messageId / themeId / taskCommentId / taskId の XOR（ちょうど一つが非 NULL）は CHECK 制約
+  // reaction_target_xor で担保するが、これは prisma schema では表現できず手書きマイグレーション
+  // （20260604013030_add_reaction → 20260708120000_dsk_0297_reaction_task_comment_target →
+  // 20260710120000_dsk_0297_reaction_task_target）側にのみ存在する。
+  // schema からの自動再生成では脱落し得るため、再適用要否はマイグレーション SQL を参照。
+  @@unique([messageId, authorId, emoji])
+  @@unique([themeId, authorId, emoji])
+  @@unique([taskCommentId, authorId, emoji])
+  @@unique([taskId, authorId, emoji])
+  // dsk-0323: 冗長 index 削除。@@unique([X, authorId, emoji]) の左端 prefix により
+  // X 単独検索は unique index で賄えるため、@@index([X]) は write overhead のみ増やしていた。
+  @@map("reactions")
+}
+
+// ============================================================
+// Files: Folder / File / FileVersion (ファイルタブ — システム資料リポジトリ)
+// ============================================================
+//
+// 設計正本: docs/discover/specs/2026-05-22-rete-file-tab-design.md §3（案S）/§4。
+// 単一リポジトリ + 自由ネストのディレクトリツリー（深さ制限なし・app 層も非制約）。
+// 実体 bytes はローカル FS（FILE_STORAGE_ROOT 配下）に StorageService 経由で保存し、メタ／版は DB。
+// 同名再アップロードは旧版を物理削除せず FileVersion として retain（版管理・operational-policy §6）。
+// 権限モデルは Desk 統一 Space（ADR 0037）へ統合する＝Folder は spaceId（NOT NULL）を持ち、可視性は
+// 「チャネル可視＝配下ファイル可視」として ScopeVisibilityService で解決する（ADR 0063・開発統括決定 2026-08-03）。
+// 2026-07-23 の「純 per-folder ACL・Folder は spaceId を持たない」案は撤回し、per-folder ACL
+// （FolderPermission / 段階権限 / 継承フラグ）は fil-0136 で撤去済み。schema 詳細設計 =
+// docs/files/space-integration-schema-design.md。
+
+model Folder {
+  id             String   @id @default(uuid())
+  name           String
+  // 帰属する器（ADR 0063）。可視性判定の唯一の入力で、null は「誰に見えるか」が決まらないため NOT NULL。
+  // 既存行は migration で DEFAULT_CHANNEL_ID へ backfill 済み。親子は同一 spaceId を **複合 FK** で
+  // DB が強制（fil-0149・LOW8 包含）：「子の space_id＝親の space_id」不変条件は app 層規約ではなく
+  // DB 不変条件。崩れても FK violation で fail-closed（service 層の cross-Space 400 が剥がれても保護される）。
+  spaceId        String   @map("space_id")
+  // ルート直下は parentFolderId=null。自己 FK でツリーを表現（深さ制限なし）。
+  parentFolderId String?  @map("parent_folder_id")
+  // 同一親グループ内の表示順（Task.sortOrder と同方針）。
+  sortOrder      Int      @default(0) @map("sort_order")
+  // 作成者。ADR 0063 で暗黙 MANAGE の意味は失い、「誰が作ったか」の監査記録として残す
+  // （FileVersion.uploadedById と対称・設計書 §3）。既存行は null。Account 削除で SetNull。
+  createdById    String?  @map("created_by_id")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  // onDelete: Restrict — 配下 folder が残る Space は削除できない（ADR 0063）。File の実体 bytes は FS 上に
+  // あり DB Cascade では storage.delete が走らず孤児 blob が残るため、Category/Task/ChatTheme の Cascade とは
+  // 意図的に非対称。Space/Project/Account の hard delete 経路は現状 app 層に無く、通常運用では発火しない。
+  space        Space       @relation(fields: [spaceId], references: [id], onDelete: Restrict)
+  // onDelete: Cascade — 親フォルダ削除で配下サブツリー（子フォルダ・ファイル）も連鎖削除。
+  // 複合 FK（fil-0149・M4）: 子の (parentFolderId, spaceId) が親の (id, spaceId) を参照する形に
+  // 拡張し、「子の space_id＝親の space_id」を DB 不変条件にする。参照側の @@unique([id, spaceId]) が
+  // 先に必要（Postgres は FK 追加時に参照側 unique を要求する）。
+  parentFolder Folder?     @relation("FolderSubfolders", fields: [parentFolderId, spaceId], references: [id, spaceId], onDelete: Cascade, onUpdate: Cascade)
+  subfolders   Folder[]    @relation("FolderSubfolders")
+  files        File[]
+  // 付与タグ（多対多 / rete-files-0033）。フォルダ削除で FolderTag も Cascade 消去。FileTag と対称。
+  tags         FolderTag[]
+  // 作成者（監査記録）。Account 削除で createdById は SetNull（フォルダは残す）。
+  createdBy    Account?    @relation("FolderCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  // 同一親フォルダ内のフォルダ名は一意。ただし Postgres は NULL を等値比較しないため、
+  // ルート直下（parentFolderId=null）の同名フォルダは本 unique では弾けない。ルート同名の防止は
+  // フォルダ作成を実装する FB-2 の app 層チェック（parentFolderId IS NULL AND name=... の findFirst）で担保する。
+  // ADR 0063 以降、この app 層チェックには spaceId 条件が要る（別 Space の同名ルートを誤検出しないため）。
+  @@unique([parentFolderId, name])
+  // 複合 FK（fil-0149・M4）の参照側。parentFolder relation が (parentFolderId, spaceId) → (id, spaceId)
+  // で張るために必要（Postgres は FK 追加時に参照側 unique を要求する）。id 単独は @id で別途確保済。
+  // **migrate diff が「不要に見える」からといって消さない（fil-0157）**: この unique は複合 FK の
+  // 参照側として機能しており、消すと migration が生成されてしまう。自動生成が要らなく見えても、
+  // 削除は複合 FK の張り替え（§13.7）として扱う。
+  @@unique([id, spaceId])
+  // 器スコープのツリー取得（findAllFolders の spaceId 絞り）に効く。
+  // **第2列 sortOrder は findAllFolders の ORDER BY（parentFolderId, sortOrder, name）と一致せず、
+  // 並べ替えには寄与しない**（fil-0149・M7）。index 自体は spaceId 絞り専用として有効で張り替え不要。
+  // Space.@@index([projectId, sortOrder]) とは別物のため同名にしない（旧コメントの誤導）。
+  @@index([spaceId, sortOrder])
+  @@index([parentFolderId, sortOrder])
+  // 作成者削除（onDelete SetNull）時の逆引きを seq scan にしないための index（Account.businessRoleId と同方針）。
+  @@index([createdById])
+  // cmn-0037(開発エージェント): フォルダ名の部分一致検索（searchFolders の ILIKE '%q%'）を seq scan に落とさない
+  // pg_trgm GIN index。@@unique は B-tree 完全一致用で ILIKE には効かないため別途必要。CREATE EXTENSION
+  // pg_trgm は migration 先頭で発行（postgresqlExtensions preview は使わず手書き raw SQL で管理）。
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@map("folders")
+}
+
+// ディレクトリ単位 ACL（model FolderPermission / enum FolderGranteeType / enum FolderPermissionLevel）は
+// ADR 0063（fil-0136）で drop した。可視性は Folder.spaceId ＋ ScopeVisibilityService の一本＝
+// 「チャネル可視＝配下ファイル可視」。旧定義を復元したい場合は migration
+// 20260803160000_fil_0136_drop_folder_permissions と、それ以前の schema 履歴を参照する。
+
+model File {
+  id        String   @id @default(uuid())
+  name      String
+  folderId  String   @map("folder_id")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  // onDelete: Cascade — フォルダ削除で配下ファイル（と版）も連鎖削除。
+  folder   Folder        @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  versions FileVersion[]
+  // 付与タグ（多対多 / rete-files-0006）。ファイル削除で FileTag も Cascade 消去。
+  tags     FileTag[]
+
+  // 同一フォルダ内のファイル名は一意（folderId は NOT NULL のため NULL 等値問題は起きない）。
+  // 同名再アップロードは新規 File ではなく版追加で扱う。
+  @@unique([folderId, name])
+  @@index([folderId])
+  // cmn-0037(開発エージェント): ファイル名の部分一致検索（searchFiles の ILIKE '%q%'）用 pg_trgm GIN index（folders と同方針）。
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@map("files")
+}
+
+// ファイル分類タグのマスタ（rete-files-0006）。名前（任意文字列）＋ lucide アイコン名を登録し、
+// FileTag を介してファイルへ多対多で付与する。アイコン許可集合は @rete/shared TAG_ICONS（SSOT）で縛る。
+model Tag {
+  id        String   @id @default(uuid())
+  // タグ名はマスタ内で一意（重複分類を防ぐ）。cmn-0038(C3): citext 化で大小無視の一意制約とし、
+  // "Urgent"/"urgent" の重複登録を DB レベルで弾く（app の事前 findByName 競合窓も塞ぐ）。
+  name      String   @unique @db.Citext
+  // lucide アイコン名（TAG_ICONS のいずれか）。app 層 DTO バリデーションで許可集合を強制する。
+  icon      String
+  // 色名（TAG_COLORS のいずれか / rete-files-0021/0022）。既存タグは default で 'slate' に倒す。
+  // 自由 hex でなく許可集合（app 層 @IsIn）で縛り、frontend のカラーレジストリと一致させる。
+  color     String   @default("slate")
+  // アーカイブ日時（fil-0094・HOME タグアーカイブ hom-0083 の横展開）。非 null = アーカイブ済。
+  // AnnouncementTag.archivedAt / Category.archivedAt と同じ設計判断＝真偽の生列ではなく nullable timestamp
+  // を持ち、mapper 層で archived: archivedAt != null を計算する。物理削除はしない（FileTag/FolderTag 付与は保持）。
+  archivedAt DateTime? @map("archived_at") @db.Timestamptz
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  files   FileTag[]
+  // フォルダへの付与（多対多 / rete-files-0033）。タグ削除で FolderTag も Cascade 消去。
+  folders FolderTag[]
+
+  @@map("tags")
+}
+
+// ファイル⇔タグの中間テーブル（多対多 / rete-files-0006）。複合主キーで同一ペアの重複付与を防ぐ。
+model FileTag {
+  fileId    String   @map("file_id")
+  tagId     String   @map("tag_id")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  // onDelete: Cascade — ファイル削除 / タグ削除のいずれでも関連付けを連鎖消去する。
+  file File @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  tag  Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([fileId, tagId])
+  // タグ起点の逆引き（このタグが付くファイル一覧 / タグ削除時の参照）用。
+  @@index([tagId])
+  @@map("file_tags")
+}
+
+// フォルダ⇔タグの中間テーブル（多対多 / rete-files-0033）。FileTag と対称な設計で、
+// 複合主キーで同一ペアの重複付与を防ぐ。フォルダにもタグを付けて横断検索（rete-files-0032）の対象にする。
+model FolderTag {
+  folderId  String   @map("folder_id")
+  tagId     String   @map("tag_id")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  // onDelete: Cascade — フォルダ削除 / タグ削除のいずれでも関連付けを連鎖消去する（FileTag と同方針）。
+  folder Folder @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  tag    Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([folderId, tagId])
+  // タグ起点の逆引き（このタグが付くフォルダ一覧 / タグ削除時の参照 / 横断検索）用。
+  @@index([tagId])
+  @@map("folder_tags")
+}
+
+model FileVersion {
+  id           String   @id @default(uuid())
+  fileId       String   @map("file_id")
+  // 同一ファイル内の版番号（1 始まりの連番）。最新版は versionNo 降順で引く。
+  versionNo    Int      @map("version_no")
+  // FILE_STORAGE_ROOT からの相対 storage key（StorageService が実体パスへ解決）。
+  // 一意性は FB-2 で版ごとに id を埋め込んだキーを発行し app 層が担保する（DB unique は張らない）。
+  storageKey   String   @map("storage_key")
+  // 大容量ファイル（2GB 超）でも 32bit overflow しないよう BigInt。mapper で Number 化し DTO（number）へ。
+  byteSize     BigInt   @map("byte_size")
+  mimeType     String   @map("mime_type")
+  uploadedById String   @map("uploaded_by_id")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  // onDelete: Cascade — ファイル削除で全版メタも消える（FS 実体は app 層で StorageService が削除）。
+  file        File         @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  // onDelete: Restrict — 版が残る限りアップロード者 Account を消せない（帰属保護・chat と同方針）。
+  uploadedBy  Account      @relation(fields: [uploadedById], references: [id], onDelete: Restrict)
+  // この版を指す添付（Desk 添付 FL-3）。版（＝ファイル）削除で添付も Cascade 消去。
+  attachments Attachment[]
+
+  // 最新版取得（versionNo 降順 take 1）は本 unique index の逆順スキャンで足りるため別 index は張らない。
+  @@unique([fileId, versionNo])
+  @@index([uploadedById])
+  @@map("file_versions")
+}
+
+// ファイルアップロードの業務設定（最大サイズ・許可拡張子）。設定タブ（spec §7）から編集する。
+// controller の hard cap（OOM/DoS backstop・100MiB）とは別レイヤの業務上限で、その範囲内で可変。
+// 単一行運用: 固定 id（FILE_SETTINGS_SINGLETON_ID）で常に upsert し、複数行を作らない。
+// 未設定（行なし）時は app 既定（DEFAULT_MAX_SIZE_BYTES / 全許可）にフォールバックする（mapper.toFileSettings）。
+model FileSettings {
+  id String @id
+
+  // 業務上の最大アップロードサイズ（bytes）。BigInt は FileVersion.byteSize と同方針（大容量でも overflow しない）。
+  // app 層（service / DTO バリデーション）で hard cap 以下に制約する。
+  maxSizeBytes BigInt @map("max_size_bytes")
+
+  // 許可拡張子（`.pdf` 形式・小文字正規化）。空配列 = 全拡張子許可（既定）。MIME ではなく拡張子で判定する。
+  // DB DEFAULT '{}' で直 SQL / seed が列を省略しても NULL 行が混入しない（mapper の [...null] 事故を防ぐ）。
+  allowedExtensions String[] @default([]) @map("allowed_extensions")
+
+  // 追加で拒否する拡張子（`.pdf` 形式・小文字正規化・v2-197）。空配列 = 追加の拒否なし。
+  // 許可拡張子より先に判定し、両方に載る場合は拒否を優先する。常に拒否する拡張子（.exe / .dll / .msi /
+  // .scr / .com）はコード定数 FIXED_REJECTED_EXTENSIONS の層（要求版2）へ分離したため、service は保存時に
+  // この列からそれらを除く。中身が実行形式のファイルの常時拒否（署名検査）も別の層で、設定からは外せない。
+  rejectedExtensions String[] @default([]) @map("rejected_extensions")
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@map("file_settings")
+}
+
+// ============================================================
+// Attachment (Desk 添付 — タスク/チャット発話 ↔ ファイル版の中間テーブル)
+// ============================================================
+//
+// 設計正本: docs/files/build-plan.md §7.3（Phase FL-3・案A 中間テーブル方式・開発統括確定 2026-06-05）。
+// Desk のタスク（Task）／チャット発話（ChatMessage）／チャットテーマ（ChatTheme）に File タブの
+// ファイルを添付する多対多リンク。テーマ添付は FL-3b で追加（新規作成コンポーザ／編集モードの添付先）。
+// 添付は「添付時点の版」を固定する（fileVersionId で特定 FileVersion を指す）。後からファイルに新版が
+// 上がっても添付内容は当時の版を指し続ける（UX: 添付＝当時のスナップショット。案A の版固定要件）。
+// ポリモーフィック添付先は Reaction（messageId/themeId XOR）と同方針で、taskId / chatMessageId / themeId /
+// announcementId / taskCommentId のちょうど一方が非 NULL とする（H0022 で掲示板通知、dsk-0249 でタスク
+// コメント＝スレッド投稿物を添付先に追加）。
+// Task.id は Int・ChatMessage.id / ChatTheme.id / Announcement.id / TaskComment.id は UUID で型が異なるため別列に持つ。
+// CHECK 制約 attachment_target_xor は prisma schema で表現できないため手書き migration 側にのみ存在する
+// （reaction_target_xor と同じ運用。db push / baseline 再採番では脱落し得るので migration SQL を参照）。
+// 最新定義＝migration 20260630120000_add_attachment_task_comment_target（5分岐＝task/chatMessage/theme/
+// announcement/taskComment のちょうど1つ非NULL）。**添付先の列を増減する時は対応
+// migration で attachment_target_xor を必ず張り替える**。アプリ層は AttachmentsService.resolveTarget が
+// targetType ごとに 1 列のみ埋めて XOR を保証する（型安全側の二重防御・rete-desk-0207）。
+// 権限（添付先ファイルの role 粒度）・削除済みファイルの添付表示は後フェーズ Phase FB+/FL+ に従属
+// （MVP は全認証ユーザー共通アクセス。ファイル削除時は onDelete:Cascade で添付も消える）。
+model Attachment {
+  id             String   @id @default(uuid())
+  // 添付対象のファイル版（添付時点の版を固定）。File ではなく FileVersion を指すことで版固定を実体化する。
+  fileVersionId  String   @map("file_version_id")
+  // ポリモーフィック添付先（XOR: ちょうど一つが非 NULL・制約の所在と保守注意はモデル冒頭コメント参照）。
+  taskId         Int?     @map("task_id")
+  chatMessageId  String?  @map("chat_message_id")
+  themeId        String?  @map("theme_id")
+  announcementId String?  @map("announcement_id")
+  // タスクコメント（スレッド投稿物）への添付（dsk-0249）。チャット返信（chatMessage）と対称に、タスク詳細
+  // のコメント＝投稿物に添付がぶら下がる。TaskComment.id は UUID。
+  taskCommentId  String?  @map("task_comment_id")
+  // 添付者（監査・帰属）。chat / file version と同方針で Account へ正規化（表示名文字列を持たない）。
+  attachedById   String   @map("attached_by_id")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  // onDelete: Cascade — ファイル削除で版が消え、その版を指す添付も消える（削除済み表示は FL+ 従属）。
+  fileVersion  FileVersion   @relation(fields: [fileVersionId], references: [id], onDelete: Cascade)
+  // onDelete: Cascade — 添付先タスク削除でその添付も消える。
+  task         Task?         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  // onDelete: Cascade — 添付先メッセージ削除でその添付も消える。
+  chatMessage  ChatMessage?  @relation(fields: [chatMessageId], references: [id], onDelete: Cascade)
+  // onDelete: Cascade — 添付先テーマ削除でその添付も消える。
+  theme        ChatTheme?    @relation(fields: [themeId], references: [id], onDelete: Cascade)
+  // onDelete: Cascade — 添付先通知削除でその添付も消える（H0022）。
+  announcement Announcement? @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+  // onDelete: Cascade — 添付先タスクコメント削除でその添付も消える（dsk-0249）。
+  taskComment  TaskComment?  @relation(fields: [taskCommentId], references: [id], onDelete: Cascade)
+  // onDelete: Restrict — 添付が残る限り添付者 Account を消せない（chat / file version と同方針）。
+  attachedBy   Account       @relation(fields: [attachedById], references: [id], onDelete: Restrict)
+
+  // 同一対象への同一版の二重添付防止（Reaction の二重付与防止と同方針・NULL 列は別 unique に分割）。
+  @@unique([taskId, fileVersionId])
+  @@unique([chatMessageId, fileVersionId])
+  @@unique([themeId, fileVersionId])
+  @@unique([announcementId, fileVersionId])
+  @@unique([taskCommentId, fileVersionId])
+  @@index([taskId])
+  @@index([chatMessageId])
+  @@index([themeId])
+  @@index([announcementId])
+  @@index([taskCommentId])
+  @@index([fileVersionId])
+  @@index([attachedById])
+  @@map("attachments")
+}
+
+// ============================================================
+// Announcement (Home 掲示板の通知 — Struct Hub のお知らせ)
+// ============================================================
+//
+// 設計正本: docs/home/build-plan.md §HM-2。Home ダッシュボード（掲示板）に掲出する通知。
+// body はリッチテキスト（Tiptap 出力 HTML）で、保存前に sanitize する（ADR 0019・共有ポリシー）。
+// 投稿者は Account への FK（chat / file と同方針で表示名文字列を持たない）。
+// 作成・編集・削除は ADMIN のみ（controller の Roles ガードで enforce）。一覧/詳細は全認証ユーザー。
+// important/isNew 列は hom-0054 で廃止（タグで代替）。
+model Announcement {
+  id          String   @id @default(uuid())
+  title       String
+  // 本文（sanitize 済 HTML）。空文字も許容（タイトルのみの短い通知）。
+  body        String
+  // 手動並び順（H0021 D&D）。一覧は position 昇順（同順位は publishedAt 降順）で引く。小さいほど上。
+  // 新規は先頭（既存 min - 1）に挿入し新着優先を保つ。reorder は ADMIN が全件 id 集合で index 振り直し。
+  // 既定 0 は DB フォールバックで、実際の値は create / reorder が明示採番する（favorites.sortOrder と同方針）。
+  position    Int      @default(0)
+  // 種別（hom-0072・FAQ機能）。'board'=掲示板 / 'faq'=FAQ。既定'board'で既存データは全件後方互換。
+  // 同一テーブルをkindで分岐（テーブル複製は不採用＝アーキ規約§3 コピペ禁止）。
+  kind        String   @default("board")
+  // 通知先（targetRoles / targetBusinessRoleIds）は hom-0143 で機能ごと撤去（ADR 0036 superseded）。
+  // 削除後の通知は全認証ユーザーが全件閲覧（絞り込みなし）。既存データの本文・タグ・添付・並び順は無変換で維持。
+  authorId    String   @map("author_id")
+  // 掲出日時。一覧は本列の降順で引く。作成時は now、編集では既定で変更しない。
+  publishedAt DateTime @default(now()) @map("published_at") @db.Timestamptz
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  // onDelete: Restrict — 通知が残る限り投稿者 Account を消せない（帰属保護・chat / file と同方針）。
+  author         Account                     @relation(fields: [authorId], references: [id], onDelete: Restrict)
+  // 各アカウントの既読マーカー（HM-3・ADR 0029）。通知削除で Cascade（読了行は派生データ）。
+  readStates     AnnouncementReadState[]
+  // 添付ファイル（H0022）。通知削除で Cascade（Attachment.onDelete:Cascade）。
+  attachments    Attachment[]
+  // お知らせ専用タグ（rete-home-0043）。お知らせ削除で AnnouncementTagAssignment も Cascade 消去。
+  tagAssignments AnnouncementTagAssignment[]
+
+  // 一覧の主クエリ（kind スコープ + position 昇順 + publishedAt 降順 tiebreak + pagination）に効く。
+  // sort 方向を query（position ASC, publishedAt DESC）と一致させ、B-tree の混在方向フォールバックを避ける。
+  @@index([kind, position, publishedAt(sort: Desc)])
+  @@index([publishedAt])
+  @@index([authorId])
+  // 通知先 GIN index ×2（targetRoles / targetBusinessRoleIds）は hom-0143 で列ごと撤去。
+  @@map("announcements")
+}
+
+// お知らせ専用タグマスタ（rete-home-0043）。File の Tag マスタ（全ユーザー編集可・File/Folder 共有）とは
+// 別系統。システム共通の単一マスタで、CRUD は ADMIN のみ（announcement-tags module の @Roles で enforce）。
+model AnnouncementTag {
+  id         String    @id @default(uuid())
+  // 種別（hom-0072・FAQ機能）。'board'=掲示板 / 'faq'=FAQ。既定'board'。掲示板とFAQで同名タグを別々に登録できる。
+  kind       String    @default("board")
+  // cmn-0038(C3): Tag と同様に citext 化（大小無視の一意・別マスタだが同方針）。一意制約は kind+name の複合へ変更
+  // （旧 name 単体 unique は撤去。既存データは全件 kind='board' のため name 単体 unique より粗い制約への
+  // 移行＝制約違反は起きない）。
+  name       String    @db.Citext
+  icon       String
+  color      String    @default("slate")
+  // アーカイブ日時（hom-0083）。非 null = アーカイブ済。Category.archivedAt（rete-desk-0140）と
+  // 同じ設計判断＝真偽の生列ではなく nullable timestamp を持ち、mapper 層で archived: archivedAt != null
+  // を計算する。物理削除はしない。
+  archivedAt DateTime? @map("archived_at") @db.Timestamptz
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  announcements AnnouncementTagAssignment[]
+
+  @@unique([kind, name])
+  @@map("announcement_tags")
+}
+
+// お知らせ ↔ タグの中間テーブル（多対多 / rete-home-0043）。複合主キーで同一ペアの重複付与を防ぐ。
+model AnnouncementTagAssignment {
+  announcementId String   @map("announcement_id")
+  tagId          String   @map("tag_id")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  // onDelete: Cascade — お知らせ削除 / タグ削除のいずれでも関連付けを連鎖消去する。
+  announcement Announcement    @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+  tag          AnnouncementTag @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([announcementId, tagId])
+  @@index([tagId])
+  @@map("announcement_tag_assignments")
+}
+
+// 通知（掲示板）の既読マーカー（HM-3・ADR 0029）。account × announcement の有無で「既読/未読」を表す。
+// ChatReadState（ADR 0024）と同型だが意味論が異なる: あちらは last-read ポインタ（stream の未読集約）、
+// こちらは個別記事の読了フラグ（行が在れば既読・編集では未読化しない）。最初から accountId スコープで持つため
+// マルチユーザー化（ADR 0020）でも作り直しが不要（先送り根拠を設計で満たす / ADR 0029）。
+model AnnouncementReadState {
+  accountId      String   @map("account_id")
+  announcementId String   @map("announcement_id")
+  // 読了時刻。既読化（詳細 GET の副作用）で now へ upsert（冪等）。表示には使わず監査・将来用。
+  readAt         DateTime @default(now()) @map("read_at") @db.Timestamptz
+
+  // onDelete: Cascade — 既読状態は派生データのため、アカウント／通知削除で一緒に消える。
+  account      Account      @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  announcement Announcement @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+
+  @@id([accountId, announcementId])
+  // 未読集約（findReadIds の announcementId IN / 通知削除時の逆引き）に効く。
+  @@index([announcementId])
+  @@map("announcement_read_states")
+}
+
+// テナント（運営法人）。単一テナント前提（ADR 0017）のため固定 id の singleton 1 行のみで運用する。
+// マルチテナント化（tenant_id 伝播）は ST-3 RBAC 着手時に再評価する。FileSettings と同じ固定 id singleton パターン。
+model Tenant {
+  id String @id
+
+  // テナント表示名（設定タブで編集 / 最大 20 文字は app 層 DTO で制約）。
+  name String
+
+  // テナントバッジ配色。'green' | 'red' | 'blue' | 'none'（none=配色なし）。値域は app 層（@IsIn）で制約。
+  badgeColor String @default("none") @map("badge_color")
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@map("tenants")
+}
+
+// ログイン設定 — パスワードポリシー（Settings ST-2-1）。単一テナント前提（ADR 0017）のため固定 id の singleton 1 行。
+// 必須文字種フラグ + 最小桁数を保持し、パスワード設定/変更時の強度検証（common/security/password-policy）に供給する。
+// enforcement（実際の検証適用）の接続先（signup / パスワード変更フロー）は順次配線。MFA は §7 fill 後に別モデルで追加。
+model PasswordPolicy {
+  id String @id
+
+  // 必須文字種（チェックした種別を 1 文字以上含むことを必須とする）。
+  requireLowercase Boolean @default(true) @map("require_lowercase")
+  requireUppercase Boolean @default(true) @map("require_uppercase")
+  requireNumber    Boolean @default(true) @map("require_number")
+  requireSymbol    Boolean @default(false) @map("require_symbol")
+
+  // 最小桁数（4-64 は app 層 DTO で制約）。
+  minLength Int @default(8) @map("min_length")
+
+  // 全体強制 MFA（ST-2-2・全体強制トグル）。ON で local 認証の全メンバーが TOTP 設定完了まで保護ルートを遮断する。
+  // 認証境界の設定のため Tenant ではなく login-settings の singleton に載せる（ADMIN 管理）。SSO 経由には適用しない（IdP MFA 尊重）。
+  mfaEnforced Boolean @default(false) @map("mfa_enforced")
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@map("password_policies")
+}
+
+// MFA/TOTP 設定（Settings ST-2-2・1 アカウント 1 行）。認証アプリ（TOTP）方式（モック逸脱: method email→totp / ADR 0039）。
+// totpSecret は AES-256-GCM で暗号化して保管し、平文は一切 DB に持たない（common/security/secret-crypto）。
+// secret 生成（setup）時点では enabled=false、初回 TOTP 検証（confirm）成功で enabled=true + confirmedAt をセットする。
+model MfaSetting {
+  id        String @id @default(uuid())
+  accountId String @unique @map("account_id")
+
+  // AES-256-GCM 暗号化した TOTP secret（"iv:authTag:ciphertext" の hex 連結）。平文 secret は保持しない。
+  totpSecret String @map("totp_secret")
+
+  // 有効化フラグ。setup 直後は false、confirm 成功で true。enabled=true の account のみログインで MFA チャレンジを課す。
+  enabled Boolean @default(false)
+
+  // 初回 TOTP 検証に成功した時刻（= MFA 有効化時刻）。未確認なら null。
+  confirmedAt DateTime? @map("confirmed_at") @db.Timestamptz
+
+  // 直近に使用した TOTP の time-step counter（30秒刻み・cmn-0094 replay 対策・ADR 0040 revisit）。
+  // otplib の delta から算出した usedCounter (= floor(Date.now()/1000/30) + delta) を条件付き更新で記録する。
+  // 次回以降、これ以下の値を持つコードを送られたら「既に使用済」として拒否する（実効約90秒窓の replay を塞ぐ）。
+  // null は未記録（既存セットアップ済みアカウントの後方互換）。
+  lastUsedCounter Int? @map("last_used_counter")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@map("mfa_settings")
+}
+
+// MFA バックアップコード（Settings ST-2-2・single-use 復旧手段）。設定時に 10 個発行し平文は一度だけ返す。
+// DB には argon2 ハッシュのみ保持（auth.service と同じ @node-rs/argon2）。検証成功で usedAt をセットし再利用を防ぐ。
+model MfaBackupCode {
+  id        String @id @default(uuid())
+  accountId String @map("account_id")
+
+  // バックアップコード平文の argon2 ハッシュ。平文は DB にも log にも残さない。
+  codeHash String @map("code_hash")
+
+  // 使用済み時刻（null=未使用）。検証成功で now() をセットし single-use を保証する。
+  usedAt DateTime? @map("used_at") @db.Timestamptz
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId])
+  @@map("mfa_backup_codes")
+}
+
+// ログイン設定 — IP アドレス許可リスト 1 エントリ（Settings ST-2-3）。空リスト = 制限なし。
+// PUT は全置換（deleteMany→createMany）。CIDR の妥当性は app 層（common/net/cidr）で検証。
+// enforcement（登録 CIDR 外アクセスの遮断 middleware）は hardening 連携で別途。本フェーズは設定の保存・取得のみ。
+model IpWhitelistEntry {
+  id String @id @default(uuid())
+
+  // 許可 CIDR（IPv4 / IPv6）。
+  cidr String
+
+  // 備考（任意・空可）。
+  note String @default("")
+
+  // 表示順（昇順・入力行の順序を保持）。
+  sortOrder Int @map("sort_order")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([sortOrder])
+  @@map("ip_whitelist_entries")
+}
+
+// テナントが利用するサブシステム。管理画面で有効/無効・表示順（D&D）を管理する。
+// id は安定コード（'SYS-001' / 'RETE-DESK' / 'RETE-FILE' 等）。hub メニュー（導線）とは別概念で、ここは admin 管理メタデータ。
+model TenantSystem {
+  id String @id
+
+  // システム表示名。
+  name String
+
+  // rete 内製システム（チャット/タスク/ファイル）か。外部連携システムと区別する表示用フラグ。
+  isRete Boolean @default(false) @map("is_rete")
+
+  // 利用有効フラグ。
+  enabled Boolean @default(true)
+
+  // 表示順（昇順）。D&D 並び替えで更新する。
+  sortOrder Int @default(0) @map("sort_order")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+
+  @@index([sortOrder])
+  @@map("tenant_systems")
+}
+
+// ============================================================
+// 操作ログ / 監査 (Settings ST-6 — 閲覧 / 検索 / CSV 出力レイヤ)
+// ============================================================
+//
+// テナント全体の監査ログ。本フェーズは「閲覧 / 検索 / 出力」まで（build-plan ST-6）。
+// **記録 infra（全認可下操作を書き込む横断 interceptor + retention purge[12ヶ月]）は hardening H5 の責務**。
+// ST-3=定義 / H4=enforcement と同じ「定義先行・記録後追い」の分割で、本モデルは H5 の書き込み先を先に確定する。
+//
+// 監査の不変性のため actor / system は **スナップショット列**（actorName / actorEmail / systemName）を持つ:
+// account / TenantSystem が後で削除・改名されてもログの履歴が壊れない（FK だけだと SetNull で誰の操作か消える）。
+// actorAccountId は将来のドリルダウン用に FK（SetNull）も残すが、表示は常にスナップショットを使う。
+// systemId は FK にしない: 'システム共通'（認証等の横断操作）は TenantSystem 行を持たないため null で表す。
+model AuditLog {
+  id String @id @default(uuid())
+
+  // 実行者（account）への参照。削除時 SetNull（ログは残す）。表示は actorName/actorEmail スナップショットを使う。
+  actorAccountId String? @map("actor_account_id")
+  // 実行者の表示名 / メール（記録時点のスナップショット・NOT NULL）。
+  actorName      String  @map("actor_name")
+  actorEmail     String  @map("actor_email")
+
+  // 対象システム。外部連携 system は TenantSystem.id を入れる（FK にはしない）。横断操作（認証等）は null。
+  systemId   String? @map("system_id")
+  // 対象システムの表示名スナップショット（'system-A 商品管理' / 'システム共通' 等）。
+  systemName String  @map("system_name")
+
+  // 操作種別。値域は @rete/shared AUDIT_ACTION_TYPES（app 層 @IsIn で強制 / DB enum は採らない）。
+  actionType String @map("action_type")
+  // 機能名（'在庫管理' / '認証' 等・任意・空可）。
+  feature    String @default("")
+  // 内容（人間可読の要約・空可）。
+  summary    String @default("")
+  // 構造化詳細（将来 H5 の記録 infra が任意で積む payload・閲覧レイヤでは未使用）。
+  details    Json?
+
+  // 実行元 IP / User-Agent（不明は null）。
+  ipAddress String? @map("ip_address")
+  userAgent String? @map("user_agent")
+
+  // 実行日時（= 監査の主時系列。降順表示 + 期間フィルタ + CSV 期間指定の基準）。
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  // Relations
+  actor Account? @relation(fields: [actorAccountId], references: [id], onDelete: SetNull)
+
+  // 主クエリ（created_at 降順 + 期間 gte/lte）の sort/range をインデックスで支える。
+  @@index([createdAt])
+  // set-0013: keyset ページング（ORDER BY created_at, id の複合 + 同値 tie-break）を直接支える複合 index。
+  // 単独 @@index([createdAt]) は左方一致で残すが、id tie-break 側の並びは本 index が担う。
+  @@index([createdAt, id])
+  // フィルタ軸 + 時系列の複合 index。equality(先頭) → range/sort(createdAt) の順で、
+  // 「actionType/systemId で絞り込み + createdAt 降順」という UI の支配的クエリを index scan に載せる。
+  // 低カーディナリティの actionType 単独だと効きが薄いため createdAt との複合で持つ（H5 で件数が増える前に布石）。
+  @@index([actionType, createdAt])
+  @@index([systemId, createdAt])
+  // account 削除（onDelete SetNull）時の逆引きを seq scan にしないための index（ST-4 と同パターン）。
+  @@index([actorAccountId])
+  // cmn-0037(開発エージェント): 監査ログ検索（search の actorName/actorEmail ILIKE '%q%'）用 pg_trgm GIN index。
+  // OR 条件の各列を別々の単一列 trgm index で支える（files/folders 名検索と同方針）。
+  @@index([actorName(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([actorEmail(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@map("audit_logs")
+}
+
+// ============================================================
+// UserTableColumnWidth（列幅永続化 / fil-0047）
+// ============================================================
+//
+// ユーザー × テーブル × 列キー の 3 軸で列幅（px）を永続化する個人設定テーブル。
+// tableId は @rete/shared TABLE_IDS のいずれか（app 層 @IsIn で強制）。
+// columnKey は英数字・-_.:（最大 64 文字）に制限し、プロトタイプ汚染を防止する。
+// updatedAt は last-write-wins の timestamp として利用する。
+
+model UserTableColumnWidth {
+  // 所有者アカウント。Account 削除で Cascade（個人設定は派生データ）。
+  userId    String @map("user_id")
+  // テーブル識別子（TABLE_IDS のいずれか・app 層で検証）。
+  tableId   String @map("table_id")
+  // 列キー（英数字 / -_.: / 最大 64 文字・app 層で検証）。
+  columnKey String @map("column_key")
+  // 列幅（px 整数）。
+  width     Int
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relations
+  account Account @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // 3 軸の複合 unique キー（upsert の where 条件）。
+  @@unique([userId, tableId, columnKey])
+  // テーブル一覧取得（WHERE userId AND tableId）を index scan に載せる。
+  @@index([userId, tableId])
+  @@map("user_table_column_widths")
+}

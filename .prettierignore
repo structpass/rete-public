@@ -1,0 +1,50 @@
+# pnpm の lockfile は pnpm 自身が管理する。prettier が空白等を正規化しても pnpm install の
+# 解決には無害だが、差分が巨大化してレビューを阻害するため整形対象外とする。
+pnpm-lock.yaml
+
+# 公開リポ（struct-pass-reference 等）からの overlay コピー（cmn-0268 で扱う）。本リポの編集対象
+# ではなく、overlay 元の差分が伝播するだけなので整形対象外とする。
+scripts/publish/overlay/
+
+# next.js 生成物・ビルド成果物は gitignore 済みだが明示しておく。
+.next/
+dist/
+coverage/
+node_modules/
+
+# jsdom polyfill の `() => ({ ... })` を prettier が複数行へ展開すると、展開後の代入行が
+# `@ts-expect-error` ディレクティブの直下から外れて directive が unused 扱いになり、
+# さらに `[Symbol.iterator]: function* () {}` の戻り型（Generator）と DOM 型
+# （ArrayIterator<DOMRect>）の不一致が TS2578/TS2418 で surface 化する（cmn-0263）。
+# 型システムと prettier の整形が衝突する特殊ケースで、再発防止のため prettier 対象外とする。
+packages/frontend/vitest.setup.ts
+
+# cmn-0263 着手時点で未コミットの cmn-0269 向け変更（PUBLISH_OUT_ROOT / PUBLISH_CONFIG_PATH
+# 等の差し替え口）が入っており、cmn-0269 側のセッションが整形とコミットを担うため本チケットでは
+# 触らない（cmn-0263 の Surgical Changes 原則）。prettier 対象外として cmn-0269 完了までは
+# 整形を保留し、cmn-0269 完了時に prettier 対象へ戻す（必要なら派生チケットで明示）。
+scripts/publish/export.mjs
+
+# ADR 索引（docs/decisions/README.md）は gen-adr-index.mjs の生成物（手編集禁止・マーカー区間
+# は上書きされる）。生成形式が prettier の整形規則と一致しないため、整形対象外とする
+# （prettier --write すると gen-adr-index --check が stale になる・逆も同様）。
+docs/decisions/README.md
+
+# e2e 実行の生成物（bdd トランスパイル結果・セッション JSON・レポート・ラストラン記録）。
+# 生成の度に内容が変わり整形差分がノイズになるため対象外（cmn-0421）。
+e2e/.cache/
+e2e/.report/
+e2e/test-results/
+
+# Board 連携の一時ファイル（tickets ダンプ・巡回ログ）。整形対象外（cmn-0421）。
+tickets*.json
+.dev-loop-code-*.log
+
+# ローカル作業ディレクトリ・Windows のデバイスファイル名誤爆（NUL）。整形対象外（cmn-0421）。
+.hermes/
+NUL
+
+# maint-log digest（plans/）は collect.mjs の生成物で metrics が JSON 1 行の機械読取形式。
+# prettier が YAML frontmatter として展開（'key': value の複数行化）すると JSON.parse 不能になり
+# previous_digest の回帰比較が壊れるため整形対象外（2026-08-13 実証）。
+plans/

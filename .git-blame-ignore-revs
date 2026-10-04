@@ -1,0 +1,15 @@
+# .git-blame-ignore-revs
+# 整形専用コミット（prettier --write 一括適用）を git blame の対象外にする。
+# blame が整形コミットで止まると「いつ誰がこの行を変えたか」が追えなくなる問題を、
+# SHA を本ファイルへ列挙することで吸収する（git の標準機構・GitHub blame 自動対応）。
+#
+# 有効化手順（リポ clone 直後に 1 回だけ実行）:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# もしくは リポ全体既定にしたい場合は --global を付ける。
+#
+# 新しい整形コミットを切った時は、本ファイル末尾へ SHA を追記する（prettier --write 適用の度に
+# 履歴が増えるため、blame 無視対象も増やす）。
+#
+# --- entries ---
+# prettier --write 一括適用 (cmn-0263)
+b4d519c52f53e73b23bdf25f2e5b201473b52a46

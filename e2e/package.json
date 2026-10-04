@@ -1,0 +1,26 @@
+{
+  "name": "@rete/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "rete E2E tests — 権限境界・業務シナリオ退行ガード",
+  "scripts": {
+    "pretest": "pnpm --filter @rete/backend run reset:e2e-fixtures",
+    "test": "bddgen test && playwright test --config playwright.config.ts --project=authz",
+    "test:fast": "node scripts/fast-test.mjs",
+    "test:fast:report": "node scripts/fast-test.mjs --report",
+    "pretest:authz": "pnpm --filter @rete/backend run reset:e2e-fixtures",
+    "test:authz": "bddgen test && playwright test --config playwright.config.ts --project=authz",
+    "test:ui": "playwright test --config playwright.config.ts --project=ui-sso",
+    "generate": "bddgen test",
+    "report": "playwright show-report .report",
+    "type-check": "tsc --noEmit -p tsconfig.json",
+    "test:unit": "node --experimental-strip-types --test support/__tests__/*.test.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0",
+    "@types/node": "^20.17.10",
+    "otplib": "^13.4.1",
+    "playwright-bdd": "^8.2.0",
+    "typescript": "^5.7.2"
+  }
+}

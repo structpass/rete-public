@@ -1,0 +1,107 @@
+node_modules/
+.pnpm-store/
+dist/
+# 本番 seed 用に build 段で生成する JS（Dockerfile の prisma:seed:build の出力）
+dist-seed/
+coverage/
+.next/
+# dev 稼働中の本番 build 検証用の別 distDir（next.config.ts の NEXT_BUILD_DIST_DIR・cmn-0298）
+.next-verify/
+.next-prod-*/
+tmp/
+.env
+.env.local
+# 本番の実値ファイル。EC2 の clone 直下に置く運用のため、git add -A で拾わないよう無視する
+.env.production
+.env.production.local
+*.tsbuildinfo
+packages/**/.env
+
+# --- ローカル起動スクリプト（実credentials埋め込み・.env.local と同格でコミット対象外） ---
+*.local.ps1
+
+# --- desk タブ静的 PoC モック（repo root の試作 HTML/CSS。真実源としてローカル保持、版管理外） ---
+# 先頭スラッシュで root 限定。packages/**/{desk,tasks,assets,...} の正規コードは除外しない。
+/_partials/
+/assets/
+/chat/
+/desk/
+/files/
+/mock/
+/settings/
+/system/
+/tasks/
+/index.html
+/hover-teal.png
+
+# --- アップロードされたファイル実体（FILE_STORAGE_ROOT 既定。File タブ Phase FB）---
+/packages/backend/storage/
+
+# --- ローカル dev 雑多 ---
+/dev-server*.log
+/chk-restart.ps1
+/chk-rete.cmd
+/chk-rete.ps1
+/rete-dev-watchdog.ps1
+/register-rete-watchdog.ps1
+/run-watchdog-hidden.vbs
+/run-hidden.vbs
+/dev-watchdog.log
+/dev-watchdog-state.json
+/dev-watchdog.pause
+/dev-watchdog-*.pause
+/_handoff-verify/
+/.tmp-ui-loop/
+/.claude/
+
+# Claude Code 個人ローカル設定（譲渡対象外）
+.claude/settings.local.json
+
+# 開発エージェントライブUI検証の出力（スクショ等・コミット対象外）
+dev-ui-verify/
+.ui-evidence/
+# scripts/ のアンダースコア始動 = 開発エージェントスクラッチ一式（UI Gate 証跡ステージング・curl ペイロード・使い捨て mjs 等。正本は Board・git add -A 誤コミット防止）
+scripts/_*
+
+# 開発エージェントセッション作業用一時領域（コミット対象外）
+/scratchpad/
+/.scratchpad/
+/.scratchpad-approved.json
+# root 直下に漏れたスクラッチ（本来は scratchpad/ へ。先頭スラッシュで root 限定）
+/scratch-*
+/scratchpad-*
+
+# 開発エージェントスクラッチ成果物（Board API ダンプ・UI 反復の中間生成物等。git add -A での誤コミット防止・rev-quality 2026-07-31）
+# 先頭スラッシュ無し＝root / packages 配下の双方を捕捉する
+.scratch/
+.ui-iterate/
+/.t.json
+/=
+
+# 開発エージェントスクラッチ（scripts/ 直下の dot 始まり = curl ペイロード / Board 応答 / 使い捨て mjs。
+# 既存の scripts/_* と同趣旨で、命名が dot 始まりに寄った分を捕捉する。正本は Board）
+/scripts/.*
+
+# UI Gate 証跡・ライブ検証のスクショ（正本は Board の evidence。repo へは入れない＝実績としても plans/ に画像は1枚も track されていない）
+/plans/*.png
+/plans/*.jpg
+/plans/_*
+
+# Board API ダンプ（チケット一覧の使い捨て取得）
+/.tmp-*.json
+
+# Cline ハーネスのローカル状態（worktree / データ。設定・ルール本体は .clinerules/ = 追跡対象）
+/.cline/
+
+# 旧ツール時代の使い捨て成果物（dev-loop ログ・Windows リダイレクト事故ファイル・Board API ダンプ・Hermes プラン作業領域）
+/.dev-loop-code-*.log
+/NUL
+/tickets*.json
+/.hermes/
+
+# Repository-local Corepack cache used by the agent test wrapper.
+/.corepack-cache/
+
+# cmdc（Command Code CLI）の cwd 設定と dsh プラグインビルド生成物（正本は ~/.commandcode・~/.dsh/plugins-src）
+/.commandcode/
+/.dsh-plugin-build/

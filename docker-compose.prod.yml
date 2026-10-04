@@ -1,0 +1,186 @@
+# Struct Rete — 本番用 compose（cmn-0402）。
+# 写し元＝struct-pass-reference/docker-compose.prod.yml（parity）。rete 固有の差:
+#   - caddy を含めない（同居サーバーの共有 Caddy が 443 を握っているため・TLS 終端は共有側に任せる）。
+#     共有 Caddy からの到達経路は共有 network `edge` 経由。`edge` は reference compose が所有し、
+#     rete は external 参照で相乗りするだけ（rete の deploy script は作成せず存在を確認する＝deploy-setup.md §1）。
+#     Caddy site 追記の手順は Phase C（cmn-0403）。
+#   - ホスト公開ポートは 127.0.0.1 バインド（ホスト上のデバッグ・疎通確認用。外部直接公開しない）。
+#   - DB 名・サービス名・ネットワーク名は rete 命名。
+#   - top-level name: rete-prod を明示（cmn-0415）。dev compose（docker-compose.yml・name: rete）と
+#     プロジェクト名を分離し、同一ディレクトリ共存のまま相互 Recreate しないようにする（実測事故由来）。
+# 譲渡先は .env.production を置いて補間変数を埋める（Phase C・cmn-0403 の .env.production.example 参照）。
+
+name: rete-prod
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: rete-prod-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rete}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-rete_prod}
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: '--auth-host=scram-sha-256'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - rete-prod-network
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-rete}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+  backend:
+    build:
+      context: .
+      dockerfile: packages/backend/Dockerfile
+      platforms:
+        - linux/arm64
+    container_name: rete-prod-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      # connection_limit / pool_timeout は operational-policy §4 の必須プール指定（cmn-0251）。
+      # 本番起動時に validateDatabasePoolLimits が検査し、無いと fail-fast する。
+      DATABASE_URL: postgresql://${POSTGRES_USER:-rete}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rete_prod}?schema=public&connection_limit=5&pool_timeout=20
+      # DOMAIN は初出のここで :? ガード（写し元では caddy サービスが兼ねていたガードが caddy 非含有で
+      # 消えるため。未設定だと https:// 空ホストが CORS/OIDC/NEXT_PUBLIC へ黙って焼き込まれる）。
+      CORS_ORIGIN: https://${DOMAIN:?DOMAIN is required}
+      # 本番必須 secret（main.ts の validateProductionSecrets が起動時に検査・欠落は fail-fast）。
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
+      OIDC_COOKIE_KEYS: ${OIDC_COOKIE_KEYS:?OIDC_COOKIE_KEYS is required}
+      OIDC_JWKS: ${OIDC_JWKS:?OIDC_JWKS is required}
+      # OIDC IdP（rete 自身）の公開 base URL。localhost 既定だと外部 RP が到達できない。
+      OIDC_ISSUER: https://${DOMAIN}/api/v1/oidc
+      # reference からの SSO 用の静的 RP client 登録 3 変数（oidc-config.factory.ts が SECRET +
+      # REDIRECT_URIS 有効値の 2 条件で登録・CLIENT_ID は未設定なら既定 struct-pass-reference）。
+      # 空既定＝未設定の既存本番は従来どおり起動し client 0 件 fail-closed が維持される（cmn-0423）。
+      OIDC_REFERENCE_CLIENT_ID: ${OIDC_REFERENCE_CLIENT_ID:-}
+      OIDC_REFERENCE_CLIENT_SECRET: ${OIDC_REFERENCE_CLIENT_SECRET:-}
+      OIDC_REFERENCE_REDIRECT_URIS: ${OIDC_REFERENCE_REDIRECT_URIS:-}
+      # 共有 Caddy 1 段配下なので trust proxy を有効化（レート制限を実クライアント IP 単位に・ref-0062 同型）。
+      TRUST_PROXY: 'true'
+      # reference 連携の backend 設定。frontend の build-time URL とは別に、
+      # hub の導線判定と object-types proxy の実行時設定を注入する。
+      REFERENCE_APP_URL: ${REFERENCE_APP_URL:?REFERENCE_APP_URL is required}
+      REFERENCE_OIDC_READY: ${REFERENCE_OIDC_READY:-false}
+      INTEGRATION_SERVICE_TOKEN: ${INTEGRATION_SERVICE_TOKEN:-}
+      # トランザクショナルメール（招待）。SMTP_HOST + MAIL_FROM が揃うと有効化（operational-policy §4/§7・ADR 0035）。
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      MAIL_FROM: ${MAIL_FROM:-}
+      # reference 画面から rete の表示設定 API を取りに来るクロスサービス通信の追加許可オリジン。
+      # 空既定＝追加許可なし（従来挙動・連携フェーズで実値を設定する・cmn-0417）。
+      CROSS_SERVICE_CORS_ORIGIN: ${CROSS_SERVICE_CORS_ORIGIN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      rete-prod-network: {}
+      # 共有 Caddy からの API 到達は edge network 経由。edge 上の名前は reference の backend と
+      # 重ならない一意 alias（rete-backend）＝Caddyfile の upstream 名と一致させる（cmn-0403）。
+      edge:
+        aliases:
+          - rete-backend
+    # ホスト上のデバッグ・疎通確認用（外部直接公開はしない）。
+    ports:
+      - '127.0.0.1:${RETE_PROD_BACKEND_PORT:-3001}:3001'
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'wget',
+          '--no-verbose',
+          '--tries=1',
+          '--spider',
+          'http://localhost:3001/api/v1/health',
+        ]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+  frontend:
+    build:
+      context: .
+      dockerfile: packages/frontend/Dockerfile
+      platforms:
+        - linux/arm64
+      args:
+        # NEXT_PUBLIC 系は build 時にインライン展開される。未設定は Dockerfile 側が fail-fast で弾く
+        # （localhost が本番成果物へ黙って焼き込まれるのを防ぐ・ref-0087 同型ガード）。
+        NEXT_PUBLIC_API_BASE_URL: https://${DOMAIN}/api/v1
+        # instruction-board は開発運用タブ用＝本番では未使用可のため空を許容（:- 既定）。
+        # .env.production.example の「空でも可」と整合させる（:? だと空文字でも compose が fail する）。
+        NEXT_PUBLIC_INSTRUCTION_BOARD_URL: ${NEXT_PUBLIC_INSTRUCTION_BOARD_URL:-}
+        NEXT_PUBLIC_REFERENCE_APP_URL: ${NEXT_PUBLIC_REFERENCE_APP_URL:?NEXT_PUBLIC_REFERENCE_APP_URL is required}
+        DOCKER_BUILD: '1'
+    container_name: rete-prod-frontend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      rete-prod-network: {}
+      # 共有 Caddy からの到達は edge network 経由。edge 上の名前は reference の frontend と
+      # 重ならない一意 alias（rete-frontend）＝Caddyfile の upstream 名と一致させる（cmn-0403）。
+      edge:
+        aliases:
+          - rete-frontend
+    # ホスト上のデバッグ・疎通確認用（外部直接公開はしない）。
+    ports:
+      - '127.0.0.1:${RETE_PROD_FRONTEND_PORT:-3000}:3000'
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '-O', '/dev/null', 'http://127.0.0.1:3000/']
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+networks:
+  rete-prod-network:
+    driver: bridge
+  # reference の共有 Caddy と繋ぐ共有 network。両アプリの deploy script が不足時に作成し、
+  # compose project の所有権を片側に固定せず相乗りする。
+  edge:
+    external: true
+
+volumes:
+  postgres_data:
+    name: rete_postgres_data
+    driver: local

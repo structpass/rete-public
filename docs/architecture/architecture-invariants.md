@@ -1,0 +1,34 @@
+# Rete architecture invariants
+
+Reteで継続して守る構造上の境界です。例外を採用する場合は、理由と影響を`docs/decisions/`へ記録します。
+
+## Product sources
+
+- UI規約、用語、画面命名、モデル概念は`packages/frontend/src/features/model/content/*.ts`を正本とする。
+- 同じ仕様をAGENTS、memory、ADR本文へ複製しない。AGENTSは発火条件と入口だけを持つ。
+
+## Backend boundaries
+
+- 基本の依存方向は`Controller -> Service -> Repository -> Prisma`とする。
+- Serviceは業務判断を担当し、Repositoryはquery、永続化、transactionを担当する。
+- RepositoryはEntityを返し、Serviceがmapperを使ってResponse DTOへ変換する。
+- Prismaを直接使う例外は、基盤処理など具体的な必要性をコードとADRで説明する。
+
+## Errors and security
+
+- 想定内の業務エラーは具体的なHTTP exceptionで表す。
+- 想定外例外とPrisma例外は共通filterで処理し、汎用try/catchを各モジュールへ散らさない。
+- 認証、認可、入力検証、rate limit、lockoutはAPI境界で強制し、UI上の制御だけに依存しない。
+- secretや本番資格情報をリポジトリ、Board、ログへ記録しない。
+
+## Cross-system boundary
+
+- Reteはidentityの正本とOIDC issuerを担い、ReferenceはOIDC relying partyとして接続する。
+- 片方の障害やdeployで相手のruntime、container、データを巻き込まない。
+- 両製品の接続変更は、双方の設定、health、ログイン往復を確認する。
+
+## Verification
+
+- 機械的に強制できる規則は、AGENTSへ重ねず型、test、lint、CI、Boardサーバーゲートへ置く。
+- UI変更は`ui-verification-gate.md`、移植は`porting-parity-check.md`、Board作業は`board-session-lock.md`を適用する。
+- 完了はコード、テスト、CI、証跡またはlive状態で裏付ける。

@@ -1,0 +1,56 @@
+# Struct Rete — ローカル開発用 DB。
+# DB のみ docker で提供し、backend / frontend は `pnpm dev` で起動する想定。
+# ホスト公開ポート・認証情報は .env で上書きする（譲渡先は .env.example の素直な値で 1 台起動できる）。
+# プロジェクト名を top-level name で明示（cmn-0415）。同一ディレクトリに共存する prod compose
+# （docker-compose.prod.yml・name: rete-prod）と名前を分離し、片方の up が相手スタックの
+# postgres を「同一 service の旧コンテナ」と見なして Recreate しないようにする。
+name: rete
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: rete-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-rete}
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: '--auth-host=scram-sha-256'
+    ports:
+      # 譲渡先は 5432。開発統括ローカルは .env の RETE_DB_PORT=5434 で衝突回避。
+      - '${RETE_DB_PORT:-5432}:5432'
+    volumes:
+      - rete_postgres_data:/var/lib/postgresql/data
+    networks:
+      - rete-network
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-rete}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 開発用メール catch-all（ADR 0035）。招待メール等を実 SMTP へ送らず Mailpit が捕捉し、
+  # Web UI（既定 http://localhost:8025）で実物のレンダリングを目視確認できる。本番では使わない。
+  # backend は .env の SMTP_HOST=localhost / SMTP_PORT=1025 でここへ送る（認証なし）。
+  # profiles=dev により既定の `docker compose up` では起動せず、`docker compose --profile dev up` で起動する
+  # （本番サーバでこの compose を up しても Mailpit が全送信を握り潰す事故を構造的に防ぐ）。
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: rete-mailpit
+    profiles: ['dev']
+    restart: unless-stopped
+    ports:
+      # SMTP 受信ポート。開発統括ローカルは .env の RETE_MAILPIT_SMTP_PORT で衝突回避可。
+      - '${RETE_MAILPIT_SMTP_PORT:-1025}:1025'
+      # Web UI ポート。
+      - '${RETE_MAILPIT_UI_PORT:-8025}:8025'
+    networks:
+      - rete-network
+
+networks:
+  rete-network:
+    driver: bridge
+
+volumes:
+  rete_postgres_data:
+    driver: local

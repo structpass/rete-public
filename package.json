@@ -1,0 +1,85 @@
+{
+  "name": "@rete/monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Struct Rete - サテライトシステム（タスク + チャット連結軸）",
+  "scripts": {
+    "dev": "pnpm --parallel --filter \"./packages/**\" dev",
+    "build": "pnpm --filter \"./packages/**\" build",
+    "lint": "pnpm --filter \"./packages/**\" lint",
+    "lint:check": "pnpm --filter \"./packages/**\" --sequential lint:check",
+    "format": "pnpm --filter \"./packages/**\" format",
+    "format:check": "prettier --check .",
+    "check:repo-invariants": "node scripts/run-script-tests.mjs",
+    "check:ignored-builds": "node scripts/check-ignored-builds.mjs",
+    "check:knip-snapshot": "node --test scripts/check-knip-baseline.test.mjs",
+    "check:duplication": "jscpd",
+    "check:unused": "knip --no-exit-code",
+    "build:shared": "pnpm --filter @rete/shared build",
+    "test": "pnpm run build:shared && pnpm run check:repo-invariants && pnpm --filter \"./packages/**\" test",
+    "test:agent": "node scripts/run-tests-agent.mjs",
+    "test:cov": "pnpm run build:shared && pnpm --filter \"./packages/**\" --sequential test:cov",
+    "type-check": "pnpm run build:shared && pnpm --filter \"./packages/**\" --sequential type-check",
+    "clean": "pnpm --filter \"./packages/**\" clean && node -e \"require('fs').rmSync('node_modules',{recursive:true,force:true})\""
+  },
+  "keywords": [
+    "struct-rete",
+    "struct-pass",
+    "task-management"
+  ],
+  "engines": {
+    "node": ">=20.9.0",
+    "pnpm": ">=9.0.0"
+  },
+  "packageManager": "pnpm@9.15.4",
+  "devDependencies": {
+    "@types/node": "^20.17.10",
+    "eslint": "^9.18.0",
+    "jscpd": "^5.0.14",
+    "knip": "^5.88.1",
+    "lint-staged": "15.5.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@prisma/client",
+      "@prisma/engines",
+      "esbuild",
+      "sharp",
+      "unrs-resolver"
+    ],
+    "overrides": {
+      "multer": "^2.4.0",
+      "deepmerge-ts@7": "^8.0.1",
+      "form-data": "^4.0.6",
+      "vite": "^6.4.3",
+      "@angular-devkit/core>picomatch": "^4.0.4",
+      "lodash": "^4.18.0",
+      "postcss": "^8.5.23",
+      "sharp": "^0.35.5",
+      "js-yaml@^4.0.0": "^4.3.2",
+      "js-yaml@3": "^3.15.2",
+      "js-yaml@5": "^5.4.1",
+      "brace-expansion@1": "^1.1.20",
+      "brace-expansion@2": "^2.1.6",
+      "brace-expansion@5": "^5.0.12",
+      "fast-uri@3": "^3.1.8",
+      "ajv@8": "^8.18.0",
+      "uuid@11": "^11.1.1",
+      "qs@6": "^6.16.0",
+      "browserslist": "^4.29.3",
+      "baseline-browser-mapping": "^2.11.27",
+      "postcss-selector-parser@6": "^6.1.3",
+      "nanoid@5": "^5.1.16",
+      "nanoid@3": "^3.3.17"
+    },
+    "packageExtensions": {
+      "@hookform/resolvers": {
+        "peerDependencies": {
+          "zod": "*"
+        }
+      }
+    }
+  }
+}

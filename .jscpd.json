@@ -1,0 +1,21 @@
+{
+  "path": ["packages/shared/src", "packages/backend/src", "packages/frontend/src"],
+  "format": ["typescript", "tsx", "javascript", "jsx"],
+  "ignore": [
+    "**/*.spec.ts",
+    "**/*.spec.tsx",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/__tests__/**",
+    "**/__mocks__/**",
+    "**/dist/**",
+    "**/.next/**",
+    "**/coverage/**",
+    "**/node_modules/**"
+  ],
+  "minTokens": 50,
+  "threshold": 100,
+  "reporters": ["console"],
+  "absolute": false,
+  "gitignore": true
+}
