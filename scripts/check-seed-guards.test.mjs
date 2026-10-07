@@ -6,6 +6,8 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 const require = createRequire(import.meta.url);
 const ts = require('typescript');
+// real DB検査の依存はbackendが所有する。root workspaceから偶然解決しない。
+const backendRequire = createRequire(new URL('../packages/backend/package.json', import.meta.url));
 const seedDir = fileURLToPath(new URL('../packages/backend/prisma/', import.meta.url));
 const compile = (name) =>
   ts.transpileModule(fs.readFileSync(seedDir + name, 'utf8'), {
@@ -146,7 +148,7 @@ test(
     assert.equal(url.hostname, '127.0.0.1');
     assert.equal(url.port, '55435');
     assert.match(url.pathname, /^\/v2_354(?:_[a-f0-9]{8})?$/);
-    const { PrismaClient } = require('@prisma/client');
+    const { PrismaClient } = backendRequire('@prisma/client');
     const client = new PrismaClient({ datasourceUrl: url.href });
     try {
       assert.equal(await client.account.count(), 0, 'Use a fresh disposable DB');
@@ -155,7 +157,10 @@ test(
       const rows = await client.account.findMany({ orderBy: { id: 'asc' } });
       assert.equal(rows.length, 8);
       assert.ok(
-        await require('@node-rs/argon2').verify(rows[0].passwordHash, unique.SEED_ADMIN_PASSWORD),
+        await backendRequire('@node-rs/argon2').verify(
+          rows[0].passwordHash,
+          unique.SEED_ADMIN_PASSWORD,
+        ),
       );
       const second = await execute(
         {

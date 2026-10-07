@@ -50,7 +50,7 @@ for (const [name, manifest] of targets) {
   }
   assert.equal(git(['--reverse', '--check', '--directory=' + prefix]).status, 0);
   const require = createRequire(join(directory, 'package.json'));
-  const braces = require('./index.js');
+  const braces = require(join(directory, 'index.js'));
   assert.deepEqual(braces.expand('{a,b}'), ['a', 'b']);
   assert.throws(() => braces.parse('{'.repeat(101) + 'a' + '}'.repeat(101)), SyntaxError);
   console.log(

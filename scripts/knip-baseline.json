@@ -7,9 +7,11 @@
     "counts は増える方向だけを +10%（tolerance）で見る。減る方向＝未使用コードの掃除は無制限に通す。",
     "pg / @types/pg / tsconfig-paths は cmn-0260 で backend の直接依存から削除した（真陽性だった）。",
     "dependencyFindings は knip.jsonc の project / ignoreDependencies を調整した結果そのものなので、",
-    "完全一致で固定する＝偽陽性が戻る / 本物の未使用依存が増えるのを取りこぼさない。"
+    "完全一致で固定する＝偽陽性が戻る / 本物の未使用依存が増えるのを取りこぼさない。",
+    "v2-396: exportsを公開候補982f854の実CI37618354217で測定した67へ同期。未使用export整理は後回し。",
+    "未宣言依存と未解決importは0、toleranceと他項目の基準値は維持する。"
   ],
-  "recordedAt": "2026-08-01",
+  "recordedAt": "2026-10-07",
   "tolerance": 0.1,
   "counts": {
     "files": 9,
@@ -19,7 +21,7 @@
     "unlisted": 0,
     "binaries": 0,
     "unresolved": 0,
-    "exports": 59,
+    "exports": 67,
     "types": 149,
     "duplicates": 2,
     "catalog": 0
