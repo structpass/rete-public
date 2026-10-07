@@ -151,7 +151,7 @@ test('CI: format:check ステップとルート script が残っている (cmn-0
  * 「Unit test (E2E)」ステップと e2e の test:unit script を固定する（cmn-0376）。
  *
  * e2e の支持単体テスト（support/__tests__/*.test.ts）は `node --experimental-strip-types` で
- * TypeScript のまま実行する（Node 22+）ため .nvmrc（20.18.1）では起動しない。CI では独立 job
+ * TypeScript のまま実行する（Node 22+）。CI では独立 job
  * （e2e・node-version: 24）の「Unit test (E2E)」ステップ 1 本だけが実行経路で、これを消す・改名する・
  * script 名を変えると検査が何も落とさずに消える。経路が 1 本しかないものは、その 1 本自体を検査で
  * 押さえる（knip / format の固定と同じ運用・cmn-0376 criteria 5）。
@@ -188,7 +188,7 @@ test('CI: e2e の単体テスト（test:unit）が実行される経路が残っ
     .join('\n');
   assert.ok(
     /e2e:\s*\n\s*runs-on: ubuntu-latest[\s\S]*?node-version: 24/.test(job),
-    'test.yml に e2e 独立 job（node-version: 24）がありません＝test:unit が CI の Node 20 で起動せず赤くなります',
+    'test.yml に e2e 独立 job（node-version: 24）がありません＝test:unit の検証済み実行経路が失われます',
   );
 
   // script 自体の存在も見る（ステップだけ残って script が消えると CI で初めて落ちる）。
@@ -198,14 +198,20 @@ test('CI: e2e の単体テスト（test:unit）が実行される経路が残っ
       e2ePkg.scripts['test:unit'].includes('--test support/__tests__/*.test.ts'),
     'e2e/package.json に test:unit（support/__tests__/*.test.ts を実行する script）がありません（test.yml が呼んでいる script です）',
   );
+});
 
-  // .nvmrc は変更しない（リポ全体の Node 指定を e2e の都合で動かさない・criteria 3）。
+test('公開toolchain: Node24がCI・開発・全Docker stageで一致する (v2-395)', () => {
   const nvmrc = readFileSync(join(REPO_ROOT, '.nvmrc'), 'utf8').trim();
-  assert.equal(
-    nvmrc,
-    '20.18.1',
-    '.nvmrc が変更されています（e2e の都合でリポ全体の Node 指定を上げない・cmn-0376 criteria 3）',
-  );
+  assert.equal(nvmrc, '24', 'CIと開発にはサポート中のNode24を使う');
+  const rootPkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
+  assert.equal(rootPkg.engines.node, '>=24.0.0');
+  const yaml = readFileSync(WORKFLOW_PATH, 'utf8');
+  assert.match(yaml, /node-version-file:\s*\.nvmrc/);
+  for (const name of ['backend', 'frontend']) {
+    const dockerfile = readFileSync(join(REPO_ROOT, 'packages', name, 'Dockerfile'), 'utf8');
+    const bases = [...dockerfile.matchAll(/^FROM\s+(\S+)/gm)].map((match) => match[1]);
+    assert.deepEqual(bases, ['node:24-alpine', 'node:24-alpine', 'node:24-alpine']);
+  }
 });
 
 /**

@@ -74,7 +74,7 @@ PostgreSQL セッション永続化。
 
 ## 評価環境の起動
 
-前提：Node.js >= 20.9.0（`.nvmrc` は20.18.1）／ pnpm 9.15.4（`packageManager` 指定）／ Docker Compose（DB 用）。フォント取得と依存インストールにはネットワーク接続が必要です。
+前提：Node.js 24 LTS（`.nvmrc` は24）／ pnpm 9.15.4（`packageManager` 指定）／ Docker Compose（DB 用）。フォント取得と依存インストールにはネットワーク接続が必要です。
 
 ```bash
 # リポジトリのルートで実行。Windows PowerShellではcpの代わりにCopy-Itemも使えます。
