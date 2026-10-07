@@ -35,7 +35,7 @@ test('agent既定経路と通常testの段構成がドリフトしていない',
   const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.equal(
     packageJson.scripts.test,
-    'pnpm run build:shared && pnpm run check:repo-invariants && pnpm --filter "./packages/**" test',
+    'pnpm run test:security && pnpm run build:shared && pnpm run check:repo-invariants && pnpm --filter "./packages/**" test',
   );
 });
 

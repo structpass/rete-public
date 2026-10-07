@@ -40,6 +40,7 @@ function resolveCommands(argv, env) {
   // 先頭の build:shared は backend / frontend が @rete/shared の dist を解決するため
   // （B1・未ビルドだとクリーンな作業ツリーで型解決に失敗する）。
   const pnpmStages = [
+    ['pnpm', 'run', 'test:security'],
     ['pnpm', 'run', 'build:shared'],
     ['pnpm', 'run', 'check:repo-invariants'],
     ['pnpm', '--filter', './packages/**', 'test'],

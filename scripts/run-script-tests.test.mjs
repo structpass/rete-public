@@ -7,8 +7,13 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { REQUIRED_TESTS, EXCLUDED, allTestFiles, snapshotExcludes } from './run-script-tests.mjs';
+
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 test('REQUIRED_TESTS の各名が scripts/ に実在する（cmn-0337）', () => {
   for (const name of REQUIRED_TESTS) {
@@ -20,8 +25,47 @@ test('REQUIRED_TESTS の各名が scripts/ に実在する（cmn-0337）', () =>
   }
 });
 
-test('REQUIRED_TESTS と EXCLUDED に重複が無い（cmn-0337）', () => {
+test('延期する必須seed検査は名簿とinstall後の実行先を保持する (v2-373)', () => {
+  assert.ok(REQUIRED_TESTS.includes('check-seed-guards.test.mjs'));
+  assert.match(
+    EXCLUDED.get('check-seed-guards.test.mjs'),
+    /Install dependencies.*Seed guard checks/,
+  );
+});
+
+test('install後専用stepへ延期する必須検査は名簿と実行先を保持する', () => {
+  assert.ok(REQUIRED_TESTS.includes('check-root-dependency-fixes.test.mjs'));
+  assert.match(
+    EXCLUDED.get('check-root-dependency-fixes.test.mjs'),
+    /Dependency security regressions.*Install dependencies/,
+  );
+});
+
+test('依存回帰テストはinstall後のCI security stepから実行される', () => {
+  const workflow = readFileSync(join(REPO_ROOT, '.github/workflows/test.yml'), 'utf8').replace(
+    /\r\n/g,
+    '\n',
+  );
+  const invariant = workflow.indexOf('run: pnpm run check:repo-invariants');
+  const install = workflow.indexOf('pnpm install --frozen-lockfile');
+  const security = workflow.indexOf('run: pnpm run test:security');
+  assert.ok(
+    invariant >= 0 && install > invariant,
+    'repo invariant checksは依存install前に実行する',
+  );
+  assert.ok(security > install, 'dependency security regressionsはinstall後に実行する');
+
+  const packageJson = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
+  assert.ok(
+    packageJson.scripts['test:security'].includes('scripts/check-root-dependency-fixes.test.mjs'),
+    'test:securityから依存回帰テストが消えています',
+  );
+});
+
+test('REQUIRED_TESTS と EXCLUDED の重複は専用post-install stepを持つ検査のみ', () => {
   for (const name of REQUIRED_TESTS) {
+    if (['check-seed-guards.test.mjs', 'check-root-dependency-fixes.test.mjs'].includes(name))
+      continue;
     assert.ok(
       !EXCLUDED.has(name),
       `${name} が REQUIRED_TESTS と EXCLUDED の両方に載っています（片方にしてください）`,

@@ -6,11 +6,11 @@
 
 ## 位置づけ
 
-**Rete は StructPass リファレンス（[reference](https://github.com/structpass/reference)）のサテライトシステム**である。
+**Rete は StructPass リファレンスのサテライトシステム**である。本リポジトリはRete単独の公開版です。
 
 - **個別呼称**：**Rete**（先頭大文字固定）
 - **カテゴリ呼称**：**サテライトシステム**（本体に対し横並びで、エンドユーザーから見える独立プロダクト群の総称）
-- **本体との関係**：StructPass リファレンスを「コア」、Rete はその周囲を回る独立デプロイのサテライト 1 号機。本体のランタイム依存にはならない（落ちても本体は動く）が、エンドユーザーは Rete を直接触る点で裏方ポータルではない
+- **Referenceとの関係**：別のアプリ・DBとして配置し、ReferenceのログインはReteをOIDCの認証元として利用する。Referenceとの連携には別の実装と追加設定が必要です。
 
 ## 解く問題
 
@@ -60,7 +60,7 @@ packages/
 Files（版管理・タグ・添付）・HOME 掲示板・Settings（テナント設定 + RBAC + MFA）・
 PostgreSQL セッション永続化。
 
-公開版はこれらのコードとローカル評価用データを提供します。第三者の実データ・実運用資格情報を投入する前に、利用条件と接続先・認証設定を確認してください。MFA、メール送信、Reference連携は追加設定が必要です。
+公開版はこれらのコードとローカル評価用データを提供します。第三者の実データ・実運用資格情報を投入する前に、利用条件と接続先・認証設定を確認してください。MFA、メール送信、Reference連携は追加設定が必要です。Referenceとのログイン連携には現在、未解消の機能不備があります。公開版の評価対象と、その制約を区別してください。
 
 版の目印は各 `package.json` のバージョン（現在 `0.1.0`）と、取得した公開リポジトリのcommitです。変更内容はそのリポジトリのcommit履歴で確認してください。
 
@@ -107,6 +107,12 @@ pnpm dev
 - SMTP未設定時は招待メール等のメール依存機能を利用できません。ローカルでメールを評価する場合は `docker compose --profile dev up -d mailpit` とbackendのSMTP設定が必要です。
 - バックログタブは外部チケットツール（本公開版には含まれない）をiframe表示します。接続先が利用できなければ表示されません。
 - 上記はリポジトリのスクリプト・設定に合わせたローカル評価手順です。取得した版での初回起動結果と各機能の設定を確認してください。本番運用の手順・動作保証を意味しません。
+
+## Referenceと一緒に評価する
+
+[Reference公開版](https://github.com/structpass/reference-public)をセットで取得します。Referenceの[README](https://github.com/structpass/reference-public#両アプリの認証を接続する)が、ポート分離・OIDC設定の対応・seedのID・起動順序の正本です。
+
+共存時はRete frontend 3010 / backend 3011 / DB 5433、Reference frontend 3000 / backend 3001 / DB 5432を使います。Rete frontendのPORTとAPI URL、backendのPORT・CORS_ORIGIN・DATABASE_URL、ルート.envのRETE_DB_PORTを揃えてから、Rete→Referenceの順に起動します。Referenceのseedはパスワードを持ちません。Reteの公開評価用資格情報を、外部公開や実運用で有効なまま使わないでください。
 
 ## 概念モデル
 

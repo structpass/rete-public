@@ -158,7 +158,7 @@ Backlog のサブシステム区分と整合させた 8 トラック：
 | ID        | シナリオ                   | 前提                                                       | 操作                           | 期待結果                                         | 状態 |
 | --------- | -------------------------- | ---------------------------------------------------------- | ------------------------------ | ------------------------------------------------ | ---- |
 | S-MISC-01 | Backlog iframe 表示        | 高橋健一（Board v2(:3072・`/v2.html`)稼働中にBacklogタブ） | Backlogタブを開く              | embedded で指示ボード表示・badge（設/完）反映    | ⬜   |
-| S-MISC-02 | Board postMessage 即時更新 | 高橋がBacklog表示中・開発統括がBoard側でチケット変更           | Board側でチケット変更          | postMessage 受信で badge 即時更新                | ⬜   |
+| S-MISC-02 | Board postMessage 即時更新 | 高橋がBacklog表示中・開発統括がBoard側でチケット変更       | Board側でチケット変更          | postMessage 受信で badge 即時更新                | ⬜   |
 | S-MISC-03 | Board落下時のfallback      | 高橋（Board停止中）                                        | Backlogタブを開く              | ⚠ サイドバーfallback範囲・本体表示の挙動が未確定 | ⬜   |
 | S-MISC-04 | モデルタブ deep-link       | 鈴木一郎（実装前にモデルタブ参照）                         | `/model#<themeId>` を開く/戻る | 該当テーマが選択表示・hashchangeで追従           | ⬜   |
 

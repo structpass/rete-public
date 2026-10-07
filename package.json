@@ -16,11 +16,12 @@
     "check:duplication": "jscpd",
     "check:unused": "knip --no-exit-code",
     "build:shared": "pnpm --filter @rete/shared build",
-    "test": "pnpm run build:shared && pnpm run check:repo-invariants && pnpm --filter \"./packages/**\" test",
+    "test": "pnpm run test:security && pnpm run build:shared && pnpm run check:repo-invariants && pnpm --filter \"./packages/**\" test",
     "test:agent": "node scripts/run-tests-agent.mjs",
     "test:cov": "pnpm run build:shared && pnpm --filter \"./packages/**\" --sequential test:cov",
     "type-check": "pnpm run build:shared && pnpm --filter \"./packages/**\" --sequential type-check",
-    "clean": "pnpm --filter \"./packages/**\" clean && node -e \"require('fs').rmSync('node_modules',{recursive:true,force:true})\""
+    "clean": "pnpm --filter \"./packages/**\" clean && node -e \"require('fs').rmSync('node_modules',{recursive:true,force:true})\"",
+    "test:security": "node --test scripts/check-braces-patch.test.cjs scripts/check-root-dependency-fixes.test.mjs"
   },
   "keywords": [
     "struct-rete",
@@ -70,7 +71,10 @@
       "qs@6": "^6.16.0",
       "browserslist": "^4.29.3",
       "baseline-browser-mapping": "^2.11.27",
-      "postcss-selector-parser@6": "^6.1.3",
+      "postcss-selector-parser@6": "7.1.6",
+      "proxy-addr@2": "2.0.8",
+      "source-map-js@1": "1.2.2",
+      "smol-toml@1": "1.9.0",
       "nanoid@5": "^5.1.16",
       "nanoid@3": "^3.3.17"
     },
@@ -80,6 +84,10 @@
           "zod": "*"
         }
       }
+    },
+    "patchedDependencies": {
+      "braces@3.0.3": "patches/braces@3.0.3.patch",
+      "magicast@0.5.5": "patches/magicast@0.5.5.patch"
     }
   }
 }

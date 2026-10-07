@@ -21,6 +21,46 @@ const REPO_ROOT = join(HERE, '..');
 const WORKFLOW_PATH = join(REPO_ROOT, '.github', 'workflows', 'test.yml');
 const DEPLOY_WORKFLOW_PATH = join(REPO_ROOT, '.github', 'workflows', 'deploy.yml');
 
+function validateSeedGuardStep(yaml) {
+  const lines = yaml.split(/\r?\n/).filter((line) => !/^\s*#/.test(line));
+  const start = lines.findIndex((line) => /^      - name: Seed guard checks\s*$/.test(line));
+  assert.ok(start >= 0, 'Seed guard checks の必須stepがありません');
+  const install = lines.findIndex((line) => /^      - name: Install dependencies\s*$/.test(line));
+  assert.ok(install >= 0 && install < start, 'seed検査は依存install後に実行する');
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex((line) => /^      - /.test(line));
+  const step = rest.slice(0, end < 0 ? undefined : end).join('\n');
+  assert.match(step, /^        run: node --test scripts\/check-seed-guards\.test\.mjs\s*$/m);
+  assert.doesNotMatch(
+    step,
+    /^        (?:if|continue-on-error):/m,
+    'seed検査を条件付き/非必須にしない',
+  );
+}
+
+test('CI: seedガード検査はinstall後に必ず実行する (v2-373)', () => {
+  validateSeedGuardStep(readFileSync(WORKFLOW_PATH, 'utf8'));
+});
+
+test('CI: seed検査stepの削除・順序逆転・非必須化を検出する (v2-373)', () => {
+  const yaml = readFileSync(WORKFLOW_PATH, 'utf8');
+  const step =
+    '      - name: Seed guard checks\n        run: node --test scripts/check-seed-guards.test.mjs\n';
+  const clean = yaml.replace(/\r\n/g, '\n');
+  assert.ok(clean.includes(step));
+  assert.throws(() => validateSeedGuardStep(clean.replace(step, '')));
+  assert.throws(() =>
+    validateSeedGuardStep(
+      clean
+        .replace(step, '')
+        .replace('      - name: Install dependencies', step + '      - name: Install dependencies'),
+    ),
+  );
+  assert.throws(() =>
+    validateSeedGuardStep(clean.replace(step, step + '        continue-on-error: true\n')),
+  );
+});
+
 /**
  * 「Knip snapshot check」ステップの本体（コメント行を除いた区間）を返す。
  *

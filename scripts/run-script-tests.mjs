@@ -22,6 +22,16 @@ const SCRIPTS_DIR = dirname(fileURLToPath(import.meta.url));
 // 外したものは下でファイル名と理由をログへ出す（黙って減らさない）。
 const EXCLUDED = new Map([
   [
+    'check-root-dependency-fixes.test.mjs',
+    'It inspects installed node_modules/.pnpm copies and cannot run before install. ' +
+      'The CI Dependency security regressions step runs it after Install dependencies.',
+  ],
+  [
+    'check-seed-guards.test.mjs',
+    'typescript に依存するため install 前は実行しない。CI の Install dependencies 後の ' +
+      'Seed guard checks ステップで必須実行する。',
+  ],
+  [
     'check-knip-baseline.test.mjs',
     'knip の検出は生成物（shared の dist / Prisma Client / next typegen のルート型）に依存し、' +
       'install だけのフレッシュクローンでは未解決の import が未使用 export として数え上がる' +
@@ -52,6 +62,7 @@ const REQUIRED_TESTS = [
   'check-e2e-step-arg-resolution.test.mjs',
   'check-e2e-type-check-scope.test.mjs',
   'check-ignored-builds.test.mjs',
+  'check-root-dependency-fixes.test.mjs',
   'check-prisma-client-engine.test.mjs',
   'check-publish-export.test.mjs',
   'check-time-axis-invariants.test.mjs',
