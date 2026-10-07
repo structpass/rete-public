@@ -14,20 +14,19 @@ import {
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
-// CI run 31238015292（feat/2026-07-20 / 2026-08-08）の install ステップ出力に一致する形。
-// cmn-0343 で run 30417883753（2026-07-29）から差し替えた＝@nestjs/core が弾かれなくなったため。
+// CI run 37616649994（公開候補 eb36743 / 2026-10-07）の install出力。
 const REAL_LOG = [
   'Scope: all 4 workspace projects',
   'Lockfile is up to date, resolution step is skipped',
   'Progress: resolved 1, reused 0, downloaded 0, added 0',
-  'The following dependencies have build scripts that were ignored: @scarf/scarf, prisma',
+  'The following dependencies have build scripts that were ignored: @scarf/scarf, braces, magicast, prisma',
   'Done in 21.4s',
 ].join('\n');
 
 test('parseIgnoredBuilds: pnpm 9.15 の文言から依存名を抽出する', () => {
   const result = parseIgnoredBuilds(REAL_LOG);
   assert.equal(result.found, true);
-  assert.deepEqual(result.names, ['@scarf/scarf', 'prisma']);
+  assert.deepEqual(result.names, ['@scarf/scarf', 'braces', 'magicast', 'prisma']);
 });
 
 test('parseIgnoredBuilds: 枠線付き警告（Ignored build scripts 表現）でも読める', () => {
@@ -82,7 +81,7 @@ test('CLI: マーカー行が欠落したログでは非 0 終了する（cmn-03
 });
 
 test('compareIgnoredBuilds: 想定と一致すれば ok（順序は問わない）', () => {
-  assert.deepEqual(compareIgnoredBuilds(['prisma', '@scarf/scarf']), {
+  assert.deepEqual(compareIgnoredBuilds(['prisma', 'magicast', '@scarf/scarf', 'braces']), {
     ok: true,
     unexpected: [],
     missing: [],
@@ -100,7 +99,7 @@ test('compareIgnoredBuilds: 想定にあるのにログから消えた依存も�
   // cmn-0343 の実発火ケース＝弾かれる想定だった依存が postinstall を落として消えた形。
   const result = compareIgnoredBuilds(['prisma']);
   assert.equal(result.ok, false);
-  assert.deepEqual(result.missing, ['@scarf/scarf']);
+  assert.deepEqual(result.missing, ['@scarf/scarf', 'braces', 'magicast']);
   assert.deepEqual(result.unexpected, []);
 });
 

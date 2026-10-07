@@ -23,7 +23,10 @@ import { fileURLToPath } from 'node:url';
 // @nestjs/core@11.1.28 の package.json が scripts: {} で postinstall を持たない（実測）。
 // CI run 31238015292 の install ログでも弾かれたのは @scarf/scarf, prisma の 2 件だけだった。
 // 版が戻って postinstall が復活したら unexpected 側で赤くなるので、その時にここへ戻す。
-export const EXPECTED_IGNORED_BUILDS = ['@scarf/scarf', 'prisma'];
+// v2-393: native patch適用後のCI run 37616649994では braces/magicast も検出される。
+// 両packageに install時のlifecycleはなく、配布済みJSへpatchを適用するためbuildは不要。
+// onlyBuiltDependenciesへの実行許可は追加せず、未知の依存は引き続き拒否する。
+export const EXPECTED_IGNORED_BUILDS = ['@scarf/scarf', 'braces', 'magicast', 'prisma'];
 
 // pnpm の文言はバージョンで揺れるため、既知の 2 表現を両方見る（9.15.4 は前者）。
 const MARKER_PATTERNS = [
