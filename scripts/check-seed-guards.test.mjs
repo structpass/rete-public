@@ -78,7 +78,7 @@ async function execute(env, real) {
         hash: async (value) => {
           hashes++;
           if (!real) throw Error('STOP_BEFORE_DB');
-          return require(name).hash(value);
+          return backendRequire(name).hash(value);
         },
       };
     if (name.includes('display-name'))
@@ -140,6 +140,20 @@ for (const nodeEnv of [undefined, 'unexpected', 'production']) {
     assert.equal(r.error, 'STOP_BEFORE_DB');
   });
 }
+test('real hash dependency resolves from backend before any DB connection', async () => {
+  const client = {
+    account: {
+      async findUnique() {
+        throw Error('STOP_AFTER_REAL_HASH');
+      },
+    },
+  };
+  const r = await execute({ NODE_ENV: 'production', ALLOW_SEED: '1', ...unique }, client);
+  assert.equal(r.hashes, 1);
+  assert.equal(r.queries, 1);
+  assert.equal(r.error, 'STOP_AFTER_REAL_HASH');
+});
+
 test(
   'disposable real DB: new accounts and repeat seed preserve existing password hashes',
   { skip: !process.env.TEST_SEED_DATABASE_URL },
